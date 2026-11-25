@@ -197,7 +197,7 @@ func TestSSRFSafeTransportDialContextAndProxy(t *testing.T) {
 	}
 }
 
-func TestCrossOriginRedirectBlockedWithoutCredentialLeak(t *testing.T) {
+func TestRedirectsDisabledWithoutCredentialLeak(t *testing.T) {
 	var evilHits atomic.Int32
 	evilSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		evilHits.Add(1)
@@ -205,8 +205,21 @@ func TestCrossOriginRedirectBlockedWithoutCredentialLeak(t *testing.T) {
 	}))
 	defer evilSrv.Close()
 
-	redirector := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		http.Redirect(w, r, evilSrv.URL+"/steal", http.StatusTemporaryRedirect)
+	var sameHostHits atomic.Int32
+	var redirector *httptest.Server
+	redirector = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/messages", "/v1beta/models":
+			http.Redirect(w, r, evilSrv.URL+"/steal", http.StatusTemporaryRedirect)
+		case "/v1/chat/completions":
+			// Even same-origin redirects must not be followed.
+			http.Redirect(w, r, redirector.URL+"/v1/next", http.StatusFound)
+		case "/v1/next":
+			sameHostHits.Add(1)
+			w.WriteHeader(http.StatusOK)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
 	}))
 	defer redirector.Close()
 
@@ -226,6 +239,27 @@ func TestCrossOriginRedirectBlockedWithoutCredentialLeak(t *testing.T) {
 	}
 	if strings.Contains(res.ErrorMessage, "sk-ant-redirect-secret") || strings.Contains(res.ErrorMessage, "hdr-secret-999") {
 		t.Fatalf("cross-origin redirect error leaked secrets: %s", res.ErrorMessage)
+	}
+
+	// Same-host redirect must also be blocked without making a second request.
+	sameRes := client.ExecuteProbe(context.Background(), ProbeTarget{
+		Protocol: ProtocolOpenAIChat,
+		BaseURL:  redirector.URL,
+		APIKey:   "sk-same-origin-secret",
+	}, "gpt-4o", ProbeDefinition{ID: "p1", Kind: DetectorBehavior, Prompt: "hi", MaxTokens: 16}, false)
+	if sameRes.ErrorCode != "ssrf_blocked" || sameHostHits.Load() != 0 {
+		t.Fatalf("expected same-origin redirect blocked with 0 target hits, got hits=%d res=%+v", sameHostHits.Load(), sameRes)
+	}
+
+	// Trailing-dot redirect boundary check (example.com -> example.com.) must also be rejected.
+	hc, err := client.clientForTarget(ProbeTarget{Protocol: ProtocolOpenAIChat, BaseURL: "https://example.com"}, defaultProbeTimeout)
+	if err != nil {
+		t.Fatalf("clientForTarget failed: %v", err)
+	}
+	origReq, _ := http.NewRequest(http.MethodGet, "https://example.com/v1/models", nil)
+	dotReq, _ := http.NewRequest(http.MethodGet, "https://example.com./v1/models", nil)
+	if err := hc.CheckRedirect(dotReq, []*http.Request{origReq}); !errors.Is(err, ErrSSRFBlocked) {
+		t.Fatalf("expected trailing-dot redirect to be rejected with ErrSSRFBlocked, got %v", err)
 	}
 
 	if _, err := client.DiscoverModels(context.Background(), ProbeTarget{
@@ -413,7 +447,7 @@ func TestTransportErrorRedactsAPIKey(t *testing.T) {
 		t.Fatalf("unexpected non-JSON error message: %q", htmlRes.ErrorMessage)
 	}
 
-	// JSON-escaped secrets in error messages or wrapped error strings must be redacted.
+	// JSON-escaped secrets in error messages (including arbitrary \uXXXX escapes like \u0073k-...) must be redacted.
 	escapedSecret := `sk-<secret>&"999`
 	escapedSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusUnauthorized)
@@ -425,6 +459,25 @@ func TestTransportErrorRedactsAPIKey(t *testing.T) {
 	}, "gpt-4o", ProbeDefinition{ID: "p1", Kind: DetectorBehavior, Prompt: "hi", MaxTokens: 16}, false)
 	if escRes.ErrorCode != "auth_error" || strings.Contains(escRes.ErrorMessage, "secret") {
 		t.Fatalf("expected JSON-escaped secret redacted, got %+v", escRes)
+	}
+
+	unicodeEscapedSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = w.Write([]byte(`{"error":{"message":"invalid key \\u0073k-super-secret-999"}}`))
+	}))
+	defer unicodeEscapedSrv.Close()
+	uniRes := client.ExecuteProbe(context.Background(), ProbeTarget{
+		Protocol: ProtocolOpenAIChat, BaseURL: unicodeEscapedSrv.URL, APIKey: "sk-super-secret-999",
+	}, "gpt-4o", ProbeDefinition{ID: "p1", Kind: DetectorBehavior, Prompt: "hi", MaxTokens: 16}, false)
+	if uniRes.ErrorCode != "auth_error" ||
+		strings.Contains(uniRes.ErrorMessage, "super-secret-999") ||
+		strings.Contains(uniRes.ErrorMessage, `\u0073`) ||
+		!strings.Contains(uniRes.ErrorMessage, "upstream HTTP 401") {
+		t.Fatalf("expected \\u0073k- escaped secret replaced with generic HTTP 401 fallback, got %+v", uniRes)
+	}
+	directRedacted := redactSecrets(`bad key \u0073k-super-secret-999`, ProbeTarget{APIKey: "sk-super-secret-999"})
+	if strings.Contains(directRedacted, "super-secret-999") || strings.Contains(directRedacted, `\u0073`) {
+		t.Fatalf("expected direct redactSecrets to strip \\u0073k- secret, got %q", directRedacted)
 	}
 
 	// Also check DiscoverModels redaction and HTTP error taxonomy
@@ -811,17 +864,33 @@ func TestDiscoverModelsAllProtocols(t *testing.T) {
 
 func TestResponseBody256KBLimit(t *testing.T) {
 	oversized := strings.Repeat("x", maxResponseBodyBytes+1024)
+	validProbePrefix := `{"model":"gpt-4o","choices":[{"message":{"content":"ok"}}]}`
+	validModelsPrefix := `{"data":[{"id":"gpt-4o"}]}`
+
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/v1/models" {
-			_, _ = w.Write([]byte(`{"data":[{"id":"` + oversized + `"}]}`))
-			return
-		}
-		if r.Header.Get("X-Mode") == "error" {
+		switch r.Header.Get("X-Mode") {
+		case "error":
 			w.WriteHeader(http.StatusInternalServerError)
 			_, _ = w.Write([]byte(`{"error":{"message":"boom sk-body-secret ` + oversized + `"}}`))
-			return
+		case "trailing-spaces-over":
+			if r.URL.Path == "/v1/models" {
+				_, _ = w.Write([]byte(validModelsPrefix + strings.Repeat(" ", maxResponseBodyBytes+16-len(validModelsPrefix))))
+				return
+			}
+			_, _ = w.Write([]byte(validProbePrefix + strings.Repeat(" ", maxResponseBodyBytes+16-len(validProbePrefix))))
+		case "trailing-spaces-exact":
+			if r.URL.Path == "/v1/models" {
+				_, _ = w.Write([]byte(validModelsPrefix + strings.Repeat(" ", maxResponseBodyBytes-len(validModelsPrefix))))
+				return
+			}
+			_, _ = w.Write([]byte(validProbePrefix + strings.Repeat(" ", maxResponseBodyBytes-len(validProbePrefix))))
+		default:
+			if r.URL.Path == "/v1/models" {
+				_, _ = w.Write([]byte(`{"data":[{"id":"` + oversized + `"}]}`))
+				return
+			}
+			_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"` + oversized + `"}}]}`))
 		}
-		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"` + oversized + `"}}]}`))
 	}))
 	defer srv.Close()
 
@@ -829,8 +898,32 @@ func TestResponseBody256KBLimit(t *testing.T) {
 	res200 := client.ExecuteProbe(context.Background(), ProbeTarget{
 		Protocol: ProtocolOpenAIChat, BaseURL: srv.URL, APIKey: "sk-body-secret",
 	}, "gpt-4o", ProbeDefinition{ID: "p1", Kind: DetectorBehavior, Prompt: "hi", MaxTokens: 16}, false)
-	if res200.ErrorCode != "upstream_error" {
-		t.Fatalf("expected oversized 200 body to fail with upstream_error, got %+v", res200)
+	if res200.ErrorCode != "upstream_error" || !strings.Contains(res200.ErrorMessage, "256 KiB") {
+		t.Fatalf("expected oversized 200 body to fail with upstream_error (256 KiB limit), got %+v", res200)
+	}
+
+	// Complete valid JSON padded with trailing spaces > 256 KiB must still be rejected.
+	resPadOver := client.ExecuteProbe(context.Background(), ProbeTarget{
+		Protocol: ProtocolOpenAIChat, BaseURL: srv.URL, APIKey: "sk-body-secret",
+		ExtraHeaders: map[string]string{"X-Mode": "trailing-spaces-over"},
+	}, "gpt-4o", ProbeDefinition{ID: "p1", Kind: DetectorBehavior, Prompt: "hi", MaxTokens: 16}, false)
+	if resPadOver.ErrorCode != "upstream_error" || !strings.Contains(resPadOver.ErrorMessage, "256 KiB") {
+		t.Fatalf("expected valid JSON + trailing spaces > 256 KiB to be rejected, got %+v", resPadOver)
+	}
+	if _, err := client.DiscoverModels(context.Background(), ProbeTarget{
+		Protocol: ProtocolOpenAIChat, BaseURL: srv.URL, APIKey: "sk-body-secret",
+		ExtraHeaders: map[string]string{"X-Mode": "trailing-spaces-over"},
+	}); err == nil || !strings.Contains(err.Error(), "256 KiB") {
+		t.Fatalf("expected DiscoverModels valid JSON + trailing spaces > 256 KiB to fail, got %v", err)
+	}
+
+	// Exact 256 KiB response succeeds.
+	resPadExact := client.ExecuteProbe(context.Background(), ProbeTarget{
+		Protocol: ProtocolOpenAIChat, BaseURL: srv.URL, APIKey: "sk-body-secret",
+		ExtraHeaders: map[string]string{"X-Mode": "trailing-spaces-exact"},
+	}, "gpt-4o", ProbeDefinition{ID: "p1", Kind: DetectorBehavior, Prompt: "hi", MaxTokens: 16}, false)
+	if resPadExact.ErrorCode != "" || resPadExact.Text != "ok" {
+		t.Fatalf("expected exact 256 KiB valid JSON to succeed, got %+v", resPadExact)
 	}
 
 	res500 := client.ExecuteProbe(context.Background(), ProbeTarget{

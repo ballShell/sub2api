@@ -13,9 +13,11 @@ import (
 	"net/url"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf16"
 )
 
 const (
@@ -24,7 +26,6 @@ const (
 	maxResponseBodyBytes      = 256 << 10 // 256 KiB per response cap
 	maxDiscoverModelPages     = 10
 	maxErrorMessageChars      = 512
-	maxRedirects              = 5
 	defaultAnthropicVersion   = "2023-06-01"
 	defaultTopLogprobs        = 20
 	defaultLogprobsSeed       = 42
@@ -39,7 +40,11 @@ const (
 	redactedSecretPlaceholder = "[REDACTED]"
 )
 
-var bearerTokenPattern = regexp.MustCompile(`(?i)\bBearer\s+([^\s"',;]+)`)
+var (
+	bearerTokenPattern   = regexp.MustCompile(`(?i)\bBearer\s+([^\s"',;]+)`)
+	apiKeyTokenPattern   = regexp.MustCompile(`\b(?:sk-[A-Za-z0-9_-]{8,}|AIza[0-9A-Za-z_-]{16,})`)
+	jsonUnicodeEscapesRe = regexp.MustCompile(`\\u[0-9a-fA-F]{4}`)
+)
 
 var blockedExtraHeaders = map[string]struct{}{
 	"host":              {},
@@ -265,7 +270,7 @@ func (c *HTTPProbeClient) ExecuteProbe(
 	finish := func(res ProbeCallResult) ProbeCallResult {
 		res.LatencyMS = int(time.Since(start).Milliseconds())
 		if res.ErrorMessage != "" {
-			res.ErrorMessage = redactSecrets(res.ErrorMessage, target)
+			res.ErrorMessage = redactSecretsWithStatus(res.ErrorMessage, res.HTTPStatus, target)
 		}
 		return res
 	}
@@ -308,7 +313,7 @@ func (c *HTTPProbeClient) ExecuteProbe(
 		})
 	}
 
-	status, body, reqErr := c.doJSONRequest(reqCtx, httpClient, http.MethodPost, endpoint, payload, target)
+	status, body, exceeded, reqErr := c.doJSONRequest(reqCtx, httpClient, http.MethodPost, endpoint, payload, target)
 	if reqErr != nil {
 		return finish(ProbeCallResult{
 			HTTPStatus:   status,
@@ -329,7 +334,7 @@ func (c *HTTPProbeClient) ExecuteProbe(
 				ErrorMessage: fbErr.Error(),
 			})
 		}
-		status, body, reqErr = c.doJSONRequest(reqCtx, httpClient, http.MethodPost, endpoint, fallbackPayload, target)
+		status, body, exceeded, reqErr = c.doJSONRequest(reqCtx, httpClient, http.MethodPost, endpoint, fallbackPayload, target)
 		if reqErr != nil {
 			return finish(ProbeCallResult{
 				HTTPStatus:   status,
@@ -344,6 +349,14 @@ func (c *HTTPProbeClient) ExecuteProbe(
 			HTTPStatus:   status,
 			ErrorCode:    classifyHTTPStatus(status),
 			ErrorMessage: extractErrorMessage(status, body),
+		})
+	}
+
+	if exceeded {
+		return finish(ProbeCallResult{
+			HTTPStatus:   status,
+			ErrorCode:    errorCodeUpstreamError,
+			ErrorMessage: "response body exceeds 256 KiB limit",
 		})
 	}
 
@@ -389,13 +402,16 @@ func (c *HTTPProbeClient) DiscoverModels(ctx context.Context, target ProbeTarget
 	nextURL := baseEndpoint
 
 	for page := 0; page < maxDiscoverModelPages; page++ {
-		status, body, reqErr := c.doJSONRequest(reqCtx, httpClient, http.MethodGet, nextURL, nil, target)
+		status, body, exceeded, reqErr := c.doJSONRequest(reqCtx, httpClient, http.MethodGet, nextURL, nil, target)
 		if reqErr != nil {
 			return nil, redactError(reqErr, target)
 		}
 		if status < http.StatusOK || status >= http.StatusMultipleChoices {
-			msg := redactSecrets(extractErrorMessage(status, body), target)
+			msg := redactSecretsWithStatus(extractErrorMessage(status, body), status, target)
 			return nil, fmt.Errorf("%s: %s", classifyHTTPStatus(status), msg)
+		}
+		if exceeded {
+			return nil, errors.New("response body exceeds 256 KiB limit")
 		}
 
 		pageModels, cursorParam, cursorVal, parseErr := parseDiscoverModelsPage(target.Protocol, body)
@@ -455,52 +471,15 @@ func (c *HTTPProbeClient) clientForTarget(target ProbeTarget, timeout time.Durat
 	}
 	c.mu.Unlock()
 
-	allowLoopback := c.allowLoopback
-	lookupFn := c.lookupFn
-	failClosedOnDNS := strings.TrimSpace(target.ProxyURL) != ""
-
 	return &http.Client{
 		Transport: rt,
 		Timeout:   timeout,
-		CheckRedirect: func(req *http.Request, via []*http.Request) error {
-			if len(via) >= maxRedirects {
-				return fmt.Errorf("%w: stopped after %d redirects", ErrSSRFBlocked, maxRedirects)
-			}
-			if req == nil || req.URL == nil || len(via) == 0 || via[0].URL == nil {
-				return fmt.Errorf("%w: redirect missing URL", ErrSSRFBlocked)
-			}
-			if !sameOrigin(via[0].URL, req.URL) {
-				return fmt.Errorf("%w: cross-origin redirect is blocked", ErrSSRFBlocked)
-			}
-			return validateOutboundRequestURL(req.Context(), req.URL, allowLoopback, failClosedOnDNS, lookupFn)
+		CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
+			// Reject all redirects unconditionally so credentials and custom headers
+			// can never follow redirects across origins or trailing-dot host boundaries.
+			return fmt.Errorf("%w: HTTP redirects are not permitted", ErrSSRFBlocked)
 		},
 	}, nil
-}
-
-func sameOrigin(a, b *url.URL) bool {
-	if a == nil || b == nil {
-		return false
-	}
-	if !strings.EqualFold(a.Scheme, b.Scheme) {
-		return false
-	}
-	if normalizeHost(a.Hostname()) != normalizeHost(b.Hostname()) {
-		return false
-	}
-	return effectivePort(a) == effectivePort(b)
-}
-
-func effectivePort(u *url.URL) string {
-	if p := u.Port(); p != "" {
-		return p
-	}
-	if strings.EqualFold(u.Scheme, "https") {
-		return "443"
-	}
-	if strings.EqualFold(u.Scheme, "http") {
-		return "80"
-	}
-	return ""
 }
 
 func (c *HTTPProbeClient) doJSONRequest(
@@ -510,7 +489,7 @@ func (c *HTTPProbeClient) doJSONRequest(
 	endpoint string,
 	payload []byte,
 	target ProbeTarget,
-) (status int, body []byte, err error) {
+) (status int, body []byte, exceeded bool, err error) {
 	var bodyReader io.Reader
 	if payload != nil {
 		bodyReader = bytes.NewReader(payload)
@@ -518,21 +497,24 @@ func (c *HTTPProbeClient) doJSONRequest(
 
 	req, err := http.NewRequestWithContext(ctx, method, endpoint, bodyReader)
 	if err != nil {
-		return 0, nil, err
+		return 0, nil, false, err
 	}
 	applyProtocolHeaders(req, target, payload != nil)
 
-	resp, err := client.Do(req) //nolint:gosec // G704: URL validated by validateBaseURLWithLookup; transport enforces SSRF DialContext/RoundTrip & same-origin CheckRedirect
+	resp, err := client.Do(req) //nolint:gosec // G704: URL validated by validateBaseURLWithLookup; transport enforces SSRF DialContext/RoundTrip & CheckRedirect disables redirects
 	if err != nil {
-		return 0, nil, err
+		return 0, nil, false, err
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	raw, readErr := io.ReadAll(io.LimitReader(resp.Body, maxResponseBodyBytes))
+	raw, readErr := io.ReadAll(io.LimitReader(resp.Body, maxResponseBodyBytes+1))
 	if readErr != nil {
-		return resp.StatusCode, nil, readErr
+		return resp.StatusCode, nil, false, readErr
 	}
-	return resp.StatusCode, raw, nil
+	if int64(len(raw)) > maxResponseBodyBytes {
+		return resp.StatusCode, raw[:maxResponseBodyBytes], true, nil
+	}
+	return resp.StatusCode, raw, false, nil
 }
 
 func applyProtocolHeaders(req *http.Request, target ProbeTarget, hasBody bool) {
@@ -1224,10 +1206,17 @@ func extractErrorMessage(status int, body []byte) string {
 			}
 		}
 	}
-	if text := http.StatusText(status); text != "" {
-		return fmt.Sprintf("upstream HTTP %d %s", status, text)
+	return genericHTTPFallback(status)
+}
+
+func genericHTTPFallback(status int) string {
+	if status > 0 {
+		if text := http.StatusText(status); text != "" {
+			return fmt.Sprintf("upstream HTTP %d %s", status, text)
+		}
+		return fmt.Sprintf("upstream HTTP %d", status)
 	}
-	return fmt.Sprintf("upstream HTTP %d", status)
+	return "upstream error (redacted)"
 }
 
 func redactError(err error, target ProbeTarget) error {
@@ -1242,6 +1231,10 @@ func redactError(err error, target ProbeTarget) error {
 }
 
 func redactSecrets(msg string, target ProbeTarget) string {
+	return redactSecretsWithStatus(msg, 0, target)
+}
+
+func redactSecretsWithStatus(msg string, status int, target ProbeTarget) string {
 	if msg == "" {
 		return ""
 	}
@@ -1257,6 +1250,14 @@ func redactSecrets(msg string, target ProbeTarget) string {
 		}
 		return "Bearer " + redactedSecretPlaceholder
 	})
+	out = apiKeyTokenPattern.ReplaceAllString(out, redactedSecretPlaceholder)
+
+	if jsonUnicodeEscapesRe.MatchString(out) || strings.ContainsRune(out, '\\') {
+		unescaped := decodeJSONStringForInspection(out)
+		if containsAnySecretOrToken(unescaped, secrets) {
+			return genericHTTPFallback(status)
+		}
+	}
 
 	out = strings.NewReplacer("\r", " ", "\n", " ", "\t", " ").Replace(out)
 	out = strings.TrimSpace(out)
@@ -1265,6 +1266,63 @@ func redactSecrets(msg string, target ProbeTarget) string {
 		return string(runes[:maxErrorMessageChars]) + "..."
 	}
 	return out
+}
+
+func containsAnySecretOrToken(s string, secrets []string) bool {
+	for _, secret := range secrets {
+		if secret != "" && strings.Contains(s, secret) {
+			return true
+		}
+	}
+	if apiKeyTokenPattern.MatchString(s) {
+		return true
+	}
+	for _, m := range bearerTokenPattern.FindAllString(s, -1) {
+		if !strings.Contains(m, redactedSecretPlaceholder) {
+			return true
+		}
+	}
+	return false
+}
+
+func decodeJSONStringForInspection(s string) string {
+	var candidates []string
+	var unquoted string
+	if err := json.Unmarshal([]byte(`"`+strings.ReplaceAll(s, `"`, `\"`)+`"`), &unquoted); err == nil {
+		candidates = append(candidates, unquoted)
+	}
+	if jsonUnicodeEscapesRe.MatchString(s) {
+		candidates = append(candidates, decodeJSONUnicodeEscapes(s))
+	}
+	if len(candidates) == 0 {
+		return s
+	}
+	return strings.Join(candidates, "\n")
+}
+
+func decodeJSONUnicodeEscapes(s string) string {
+	var sb strings.Builder
+	sb.Grow(len(s))
+	for i := 0; i < len(s); {
+		if i+6 <= len(s) && s[i] == '\\' && s[i+1] == 'u' {
+			if r1, err := strconv.ParseUint(s[i+2:i+6], 16, 32); err == nil {
+				u1 := rune(r1)
+				if utf16.IsSurrogate(u1) && i+12 <= len(s) && s[i+6] == '\\' && s[i+7] == 'u' {
+					if r2, err2 := strconv.ParseUint(s[i+8:i+12], 16, 32); err2 == nil {
+						sb.WriteRune(utf16.DecodeRune(u1, rune(r2)))
+						i += 12
+						continue
+					}
+				}
+				sb.WriteRune(u1)
+				i += 6
+				continue
+			}
+		}
+		sb.WriteByte(s[i])
+		i++
+	}
+	return sb.String()
 }
 
 func collectSecrets(target ProbeTarget) []string {
