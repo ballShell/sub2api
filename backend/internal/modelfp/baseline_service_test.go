@@ -1114,6 +1114,19 @@ func TestCaptureRequiresBehaviorProbeAndFailsOnPartialPersistence(t *testing.T) 
 		suite, err := baseStore.UpsertSeedSuite(ctx, makeTestSuite())
 		require.NoError(t, err)
 
+		priorLP, err := baseStore.UpsertActiveBaseline(ctx, Baseline{
+			CanonicalModel:   "gpt-4o",
+			Protocol:         ProtocolOpenAIChat,
+			SuiteID:          suite.ID,
+			DetectorKind:     DetectorLogprobs,
+			SourceType:       SourceOfficialDirect,
+			MatchThreshold:   0.08,
+			SuspectThreshold: 0.18,
+			Notes:            "prior-active-logprobs",
+			Logprobs:         makeLogprobsSignatureFromProbes([]TokenProb{{Token: "ok", Prob: 1.0}}, []TokenProb{{Token: "ok", Prob: 1.0}}),
+		})
+		require.NoError(t, err)
+
 		job, err := svc.StartCaptureJob(ctx, CaptureRequest{
 			TargetSource: TargetSourceAdHoc,
 			Protocol:     ProtocolOpenAIChat,
@@ -1128,7 +1141,19 @@ func TestCaptureRequiresBehaviorProbeAndFailsOnPartialPersistence(t *testing.T) 
 		require.Equal(t, RunStatusFailed, done.Status)
 		require.Len(t, done.Results, 1)
 		require.Contains(t, done.Results[0].Error, "simulated behavior write failure")
+		require.Nil(t, done.Results[0].LogprobsBaselineID)
 		require.Nil(t, done.Results[0].BehaviorBaselineID)
+
+		// Atomic rollback leaves the prior active logprobs baseline untouched and writes no behavior baseline.
+		activeLP, err := baseStore.ListBaselines(ctx, BaselineFilter{CanonicalModel: "gpt-4o", Protocol: ProtocolOpenAIChat, SuiteID: suite.ID, DetectorKind: DetectorLogprobs, Status: StatusActive})
+		require.NoError(t, err)
+		require.Len(t, activeLP, 1)
+		require.Equal(t, priorLP.ID, activeLP[0].ID)
+		require.Equal(t, "prior-active-logprobs", activeLP[0].Notes)
+
+		allBH, err := baseStore.ListBaselines(ctx, BaselineFilter{CanonicalModel: "gpt-4o", Protocol: ProtocolOpenAIChat, SuiteID: suite.ID, DetectorKind: DetectorBehavior})
+		require.NoError(t, err)
+		require.Empty(t, allBH)
 	})
 }
 
@@ -1369,6 +1394,23 @@ func (f *failOnBaselineWriteStore) UpsertActiveBaseline(ctx context.Context, bas
 	return f.MemoryStore.UpsertActiveBaseline(ctx, baseline)
 }
 
+func (f *failOnBaselineWriteStore) UpsertActiveBaselinesAtomic(ctx context.Context, baselines []Baseline) ([]Baseline, error) {
+	prev := f.MemoryStore.beforeBaselineInsert
+	f.MemoryStore.beforeBaselineInsert = func(b Baseline) error {
+		if b.DetectorKind == f.failKind {
+			return f.failErr
+		}
+		if prev != nil {
+			return prev(b)
+		}
+		return nil
+	}
+	defer func() {
+		f.MemoryStore.beforeBaselineInsert = prev
+	}()
+	return f.MemoryStore.UpsertActiveBaselinesAtomic(ctx, baselines)
+}
+
 type blockingCreateCaptureStore struct {
 	*MemoryStore
 	inCreate      chan struct{}
@@ -1387,4 +1429,197 @@ func (b *blockingCreateCaptureStore) CreateCaptureJob(ctx context.Context, job C
 	close(b.inCreate)
 	<-b.releaseCreate
 	return created, err
+}
+
+func TestBaselineCaptureHeadersPrivatePromptsSeedsAndLimits(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("redacts_custom_extra_headers_and_private_prompts_in_signatures", func(t *testing.T) {
+		customPass := "my-custom-pass-99"
+		privatePrompt := "Canary Prompt Alpha 99"
+
+		client := &mockProbeClient{
+			handler: func(_ context.Context, target ProbeTarget, _ string, probe ProbeDefinition, _ bool, _ int) ProbeCallResult {
+				passed := target.ExtraHeaders["X-Relay-Pass"]
+				if probe.Kind == DetectorLogprobs {
+					return ProbeCallResult{
+						Logprobs:          []TokenProb{{Token: "tok-" + passed, Prob: 0.9}},
+						LogprobsSupported: true,
+						ResponseModel:     "gpt-4o-" + passed,
+						HTTPStatus:        200,
+					}
+				}
+				return ProbeCallResult{
+					Text:              "Reflected " + strings.ToLower(privatePrompt) + " and header=" + passed,
+					ResponseModel:     "gpt-4o-" + passed,
+					SystemFingerprint: "fp-" + passed,
+					HTTPStatus:        200,
+				}
+			},
+		}
+
+		svc, store := newTestBaselineServiceEnv(t, client, nil, nil, nil)
+		privSuite, err := store.CreateSuite(ctx, ProbeSuite{
+			SuiteKey:   "priv-cap",
+			Version:    "v1",
+			Name:       "Private Capture",
+			Visibility: VisibilityPrivate,
+			Status:     StatusActive,
+			Probes: []ProbeDefinition{
+				{ID: "lp-1", Kind: DetectorLogprobs, Prompt: privatePrompt, MaxTokens: 1, TopLogprobs: 20, Weight: 1.0},
+				{ID: "bh-1", Kind: DetectorBehavior, Prompt: privatePrompt, MaxTokens: 32, Weight: 1.0},
+			},
+		})
+		require.NoError(t, err)
+
+		job, err := svc.StartCaptureJob(ctx, CaptureRequest{
+			TargetSource: TargetSourceAdHoc,
+			Protocol:     ProtocolOpenAIChat,
+			BaseURL:      "https://api.example.com/v1",
+			APIKey:       "sk-cap-custom-hdr-1234",
+			ExtraHeaders: map[string]string{"X-Relay-Pass": customPass},
+			SuiteID:      privSuite.ID,
+			Models:       []string{"gpt-4o"},
+			SampleRounds: 3,
+		}, 1)
+		require.NoError(t, err)
+
+		done := waitForCaptureJobTerminal(t, svc, job.ID)
+		require.Equal(t, RunStatusCompleted, done.Status)
+
+		bls, err := store.ListBaselines(ctx, BaselineFilter{SuiteID: privSuite.ID, Status: StatusActive})
+		require.NoError(t, err)
+		require.Len(t, bls, 2)
+
+		raw, err := json.Marshal(bls)
+		require.NoError(t, err)
+		require.NotContains(t, string(raw), customPass)
+		require.NotContains(t, strings.ToLower(string(raw)), strings.ToLower(privatePrompt))
+		require.Contains(t, string(raw), redactedSecretPlaceholder)
+	})
+
+	t.Run("ensure_seeds_preserves_admin_edited_family_maps", func(t *testing.T) {
+		svc, _ := newTestBaselineServiceEnv(t, nil, nil, nil, nil)
+		require.NoError(t, svc.EnsureSeeds(ctx))
+
+		edited, err := svc.UpsertFamilyMap(ctx, FamilyMap{
+			CanonicalModel: "gpt-4o",
+			Family:         "gpt-4o-custom",
+			Aliases:        []string{"admin-custom-alias-4o"},
+			ConfusionPeers: []string{"custom-peer-mini"},
+		})
+		require.NoError(t, err)
+		require.Equal(t, "gpt-4o-custom", edited.Family)
+
+		// Re-running EnsureSeeds (e.g. pod restart) must NOT overwrite admin customizations.
+		require.NoError(t, svc.EnsureSeeds(ctx))
+
+		fms, err := svc.ListFamilyMaps(ctx)
+		require.NoError(t, err)
+		var found *FamilyMap
+		for i := range fms {
+			if fms[i].CanonicalModel == "gpt-4o" {
+				found = &fms[i]
+				break
+			}
+		}
+		require.NotNil(t, found)
+		require.Equal(t, "gpt-4o-custom", found.Family)
+		require.Equal(t, []string{"admin-custom-alias-4o"}, found.Aliases)
+		require.Equal(t, []string{"custom-peer-mini"}, found.ConfusionPeers)
+	})
+
+	t.Run("enforces_max_active_capture_jobs_and_caps_imported_samples", func(t *testing.T) {
+		release := make(chan struct{})
+		entered := make(chan struct{}, maxActiveCaptureJobs)
+		client := &mockProbeClient{
+			handler: func(probeCtx context.Context, _ ProbeTarget, _ string, _ ProbeDefinition, _ bool, _ int) ProbeCallResult {
+				entered <- struct{}{}
+				select {
+				case <-release:
+					return ProbeCallResult{Text: "ok", HTTPStatus: 200}
+				case <-probeCtx.Done():
+					return ProbeCallResult{ErrorCode: errorCodeContextCanceled, ErrorMessage: probeCtx.Err().Error()}
+				}
+			},
+		}
+		svc, store := newTestBaselineServiceEnv(t, client, nil, nil, nil)
+		suite := seedMinimalSuite(t, store)
+
+		for i := 0; i < maxActiveCaptureJobs; i++ {
+			_, err := svc.StartCaptureJob(ctx, CaptureRequest{
+				TargetSource: TargetSourceAdHoc,
+				Protocol:     ProtocolAnthropic,
+				BaseURL:      "https://api.anthropic.com",
+				APIKey:       "sk-cap-limit-1234",
+				SuiteID:      suite.ID,
+				Models:       []string{"claude-sonnet-4-6"},
+			}, 1)
+			require.NoError(t, err)
+		}
+		for i := 0; i < maxActiveCaptureJobs; i++ {
+			<-entered
+		}
+
+		_, err := svc.StartCaptureJob(ctx, CaptureRequest{
+			TargetSource: TargetSourceAdHoc,
+			Protocol:     ProtocolAnthropic,
+			BaseURL:      "https://api.anthropic.com",
+			APIKey:       "sk-cap-over-limit-1234",
+			SuiteID:      suite.ID,
+			Models:       []string{"claude-sonnet-4-6"},
+		}, 1)
+		require.Error(t, err)
+		require.Equal(t, 429, infraerrors.Code(err))
+		require.Equal(t, "MODELFP_TOO_MANY_ACTIVE_JOBS", infraerrors.Reason(err))
+
+		close(release)
+		svc.Stop()
+
+		// ImportBundle caps behavior samples to maxBehaviorSampleRunes.
+		destSvc, destStore := newTestBaselineServiceEnv(t, nil, nil, nil, nil)
+		longSample := strings.Repeat("z", maxBehaviorSampleRunes+600)
+		bundle := Bundle{
+			SchemaVersion:  DefaultBundleSchemaVersion,
+			ExportedAt:     time.Now().UTC(),
+			IncludePrivate: false,
+			Suites: []ProbeSuite{
+				{
+					SuiteKey:   "cap-import",
+					Version:    "v1",
+					Name:       "Cap Import",
+					Visibility: VisibilityPublic,
+					Status:     StatusActive,
+					Probes:     []ProbeDefinition{{ID: "bh-1", Kind: DetectorBehavior, Prompt: "hi", MaxTokens: 32, Weight: 1}},
+				},
+			},
+			FamilyMaps: []FamilyMap{},
+			Baselines: []Baseline{
+				{
+					CanonicalModel: "claude-sonnet-4-6",
+					Protocol:       ProtocolAnthropic,
+					SuiteKey:       "cap-import",
+					SuiteVersion:   "v1",
+					DetectorKind:   DetectorBehavior,
+					Behavior: &BehaviorSignature{
+						Probes: map[string]BehaviorProbeSignature{
+							"bh-1": {ProbeID: "bh-1", Samples: []string{longSample}},
+						},
+					},
+				},
+			},
+		}
+		sha, err := computeBundleSHA256(bundle)
+		require.NoError(t, err)
+		bundle.SHA256 = sha
+
+		impRes, err := destSvc.ImportBundle(ctx, ImportBundleRequest{Bundle: bundle})
+		require.NoError(t, err)
+		require.Equal(t, 1, impRes.BaselinesImported)
+
+		stored, err := destStore.ListBaselines(ctx, BaselineFilter{Status: StatusActive})
+		require.NoError(t, err)
+		require.Len(t, stored, 1)
+		require.Equal(t, maxBehaviorSampleRunes, len([]rune(stored[0].Behavior.Probes["bh-1"].Samples[0])))
+	})
 }

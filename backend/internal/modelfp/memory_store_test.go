@@ -24,6 +24,8 @@ type MemoryStore struct {
 	runs       map[int64]Run
 	runItems   map[int64][]RunItem
 	jobs       map[int64]CaptureJob
+
+	beforeBaselineInsert func(Baseline) error
 }
 
 var _ Store = (*MemoryStore)(nil)
@@ -205,40 +207,88 @@ func (m *MemoryStore) UpdateSuiteStatus(_ context.Context, id int64, status Stat
 	return &out, nil
 }
 
-func (m *MemoryStore) UpsertActiveBaseline(_ context.Context, baseline Baseline) (*Baseline, error) {
-	norm, _, err := normalizeBaselineForWrite(baseline)
+func (m *MemoryStore) UpsertActiveBaseline(ctx context.Context, baseline Baseline) (*Baseline, error) {
+	saved, err := m.UpsertActiveBaselinesAtomic(ctx, []Baseline{baseline})
 	if err != nil {
 		return nil, err
+	}
+	out := saved[0]
+	return &out, nil
+}
+
+func (m *MemoryStore) UpsertActiveBaselinesAtomic(_ context.Context, baselines []Baseline) ([]Baseline, error) {
+	if len(baselines) == 0 {
+		return []Baseline{}, nil
+	}
+
+	norms := make([]Baseline, len(baselines))
+	for i, baseline := range baselines {
+		norm, _, err := normalizeBaselineForWrite(baseline)
+		if err != nil {
+			return nil, err
+		}
+		norms[i] = norm
 	}
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	now := time.Now().UTC()
-	for id, existing := range m.baselines {
-		if existing.Status == StatusActive &&
-			existing.CanonicalModel == norm.CanonicalModel &&
-			existing.Protocol == norm.Protocol &&
-			existing.SuiteID == norm.SuiteID &&
-			existing.DetectorKind == norm.DetectorKind {
-			existing.Status = StatusArchived
-			existing.UpdatedAt = now
-			m.baselines[id] = existing
+	type undoEntry struct {
+		id      int64
+		existed bool
+		prev    Baseline
+	}
+	prevNextID := m.nextBaseID
+	var undoLog []undoEntry
+	rollback := func() {
+		m.nextBaseID = prevNextID
+		for i := len(undoLog) - 1; i >= 0; i-- {
+			u := undoLog[i]
+			if u.existed {
+				m.baselines[u.id] = u.prev
+			} else {
+				delete(m.baselines, u.id)
+			}
 		}
 	}
 
-	m.nextBaseID++
-	norm.ID = m.nextBaseID
-	norm.CreatedAt = now
-	norm.UpdatedAt = now
-	if suite, ok := m.suites[norm.SuiteID]; ok {
-		norm.SuiteKey = suite.SuiteKey
-		norm.SuiteVersion = suite.Version
+	now := time.Now().UTC()
+	out := make([]Baseline, 0, len(norms))
+	for _, norm := range norms {
+		if m.beforeBaselineInsert != nil {
+			if err := m.beforeBaselineInsert(norm); err != nil {
+				rollback()
+				return nil, err
+			}
+		}
+		for id, existing := range m.baselines {
+			if existing.Status == StatusActive &&
+				existing.CanonicalModel == norm.CanonicalModel &&
+				existing.Protocol == norm.Protocol &&
+				existing.SuiteID == norm.SuiteID &&
+				existing.DetectorKind == norm.DetectorKind {
+				undoLog = append(undoLog, undoEntry{id: id, existed: true, prev: cloneBaseline(existing)})
+				existing.Status = StatusArchived
+				existing.UpdatedAt = now
+				m.baselines[id] = existing
+			}
+		}
+
+		m.nextBaseID++
+		norm.ID = m.nextBaseID
+		norm.CreatedAt = now
+		norm.UpdatedAt = now
+		if suite, ok := m.suites[norm.SuiteID]; ok {
+			norm.SuiteKey = suite.SuiteKey
+			norm.SuiteVersion = suite.Version
+		}
+		stored := cloneBaseline(norm)
+		undoLog = append(undoLog, undoEntry{id: stored.ID, existed: false})
+		m.baselines[stored.ID] = stored
+		out = append(out, cloneBaseline(stored))
 	}
-	stored := cloneBaseline(norm)
-	m.baselines[stored.ID] = stored
-	out := cloneBaseline(stored)
-	return &out, nil
+
+	return out, nil
 }
 
 func (m *MemoryStore) ListBaselines(_ context.Context, filter BaselineFilter) ([]Baseline, error) {
@@ -391,6 +441,28 @@ func (m *MemoryStore) UpsertFamilyMap(_ context.Context, fm FamilyMap) (*FamilyM
 	return &out, nil
 }
 
+func (m *MemoryStore) InsertSeedFamilyMapIfMissing(_ context.Context, fm FamilyMap) error {
+	canon := strings.TrimSpace(fm.CanonicalModel)
+	if canon == "" {
+		return errors.New("canonical_model is required")
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if _, exists := m.familyMaps[canon]; exists {
+		return nil
+	}
+	m.familyMaps[canon] = FamilyMap{
+		CanonicalModel: canon,
+		Family:         strings.TrimSpace(fm.Family),
+		Aliases:        cloneStringSlice(fm.Aliases),
+		ConfusionPeers: cloneStringSlice(fm.ConfusionPeers),
+		UpdatedAt:      time.Now().UTC(),
+	}
+	return nil
+}
+
 func (m *MemoryStore) ListFamilyMaps(_ context.Context) ([]FamilyMap, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
@@ -428,10 +500,12 @@ func (m *MemoryStore) CreateRun(_ context.Context, run Run) (*Run, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
+	now := time.Now().UTC()
 	m.nextRunID++
 	stored := cloneRun(run)
 	stored.ID = m.nextRunID
-	stored.CreatedAt = time.Now().UTC()
+	stored.CreatedAt = now
+	stored.UpdatedAt = now
 	m.runs[stored.ID] = stored
 	out := cloneRun(stored)
 	return &out, nil
@@ -445,6 +519,9 @@ func (m *MemoryStore) UpdateRunProgress(_ context.Context, run Run) error {
 	if !ok {
 		return ErrNotFound
 	}
+	if isTerminalRunStatus(existing.Status) {
+		return ErrNotFound
+	}
 	existing.Status = run.Status
 	existing.CompletedModels = run.CompletedModels
 	existing.Summary = run.Summary
@@ -455,6 +532,7 @@ func (m *MemoryStore) UpdateRunProgress(_ context.Context, run Run) error {
 	if run.FinishedAt != nil {
 		existing.FinishedAt = cloneTimePtr(run.FinishedAt)
 	}
+	existing.UpdatedAt = time.Now().UTC()
 	m.runs[run.ID] = existing
 	return nil
 }
@@ -561,10 +639,12 @@ func (m *MemoryStore) CreateCaptureJob(_ context.Context, job CaptureJob) (*Capt
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
+	now := time.Now().UTC()
 	m.nextJobID++
 	stored := cloneCaptureJob(job)
 	stored.ID = m.nextJobID
-	stored.CreatedAt = time.Now().UTC()
+	stored.CreatedAt = now
+	stored.UpdatedAt = now
 	m.jobs[stored.ID] = stored
 	out := cloneCaptureJob(stored)
 	return &out, nil
@@ -578,6 +658,9 @@ func (m *MemoryStore) UpdateCaptureJob(_ context.Context, job CaptureJob) error 
 	if !ok {
 		return ErrNotFound
 	}
+	if isTerminalRunStatus(existing.Status) {
+		return ErrNotFound
+	}
 	existing.Status = job.Status
 	existing.CompletedModels = job.CompletedModels
 	existing.Results = cloneCaptureResults(job.Results)
@@ -585,6 +668,7 @@ func (m *MemoryStore) UpdateCaptureJob(_ context.Context, job CaptureJob) error 
 	if job.FinishedAt != nil {
 		existing.FinishedAt = cloneTimePtr(job.FinishedAt)
 	}
+	existing.UpdatedAt = time.Now().UTC()
 	m.jobs[job.ID] = existing
 	return nil
 }
@@ -601,10 +685,19 @@ func (m *MemoryStore) GetCaptureJob(_ context.Context, id int64) (*CaptureJob, e
 	return &out, nil
 }
 
-func (m *MemoryStore) MarkStaleRunningJobsFailed(_ context.Context, reason string) error {
+func (m *MemoryStore) MarkStaleRunningJobsFailed(ctx context.Context, reason string) error {
+	return m.MarkStaleRunningJobsFailedBefore(ctx, time.Now().UTC().Add(-defaultStaleJobGracePeriod), reason)
+}
+
+func (m *MemoryStore) MarkStaleRunningJobsFailedBefore(_ context.Context, staleBefore time.Time, reason string) error {
 	reason = strings.TrimSpace(reason)
 	if reason == "" {
 		reason = defaultRestartReason
+	}
+	if staleBefore.IsZero() {
+		staleBefore = time.Now().UTC().Add(-defaultStaleJobGracePeriod)
+	} else {
+		staleBefore = staleBefore.UTC()
 	}
 
 	m.mu.Lock()
@@ -612,20 +705,22 @@ func (m *MemoryStore) MarkStaleRunningJobsFailed(_ context.Context, reason strin
 
 	now := time.Now().UTC()
 	for id, r := range m.runs {
-		if r.Status == RunStatusQueued || r.Status == RunStatusRunning {
+		if (r.Status == RunStatusQueued || r.Status == RunStatusRunning) && r.UpdatedAt.Before(staleBefore) {
 			r.Status = RunStatusFailed
 			r.ErrorMessage = reason
 			t := now
 			r.FinishedAt = &t
+			r.UpdatedAt = now
 			m.runs[id] = r
 		}
 	}
 	for id, j := range m.jobs {
-		if j.Status == RunStatusQueued || j.Status == RunStatusRunning {
+		if (j.Status == RunStatusQueued || j.Status == RunStatusRunning) && j.UpdatedAt.Before(staleBefore) {
 			j.Status = RunStatusFailed
 			j.ErrorMessage = reason
 			t := now
 			j.FinishedAt = &t
+			j.UpdatedAt = now
 			m.jobs[id] = j
 		}
 	}

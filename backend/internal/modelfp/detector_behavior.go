@@ -40,8 +40,9 @@ func (d *BehaviorProtocolDetector) ProbeModel(
 	seenModels := make(map[string]struct{})
 	seenFingerprints := make(map[string]struct{})
 	anyReasoning := false
+	validCount := 0
 
-	obs, successCount, err := executeDetectorProbes(
+	obs, _, err := executeDetectorProbes(
 		ctx,
 		client,
 		target,
@@ -52,6 +53,10 @@ func (d *BehaviorProtocolDetector) ProbeModel(
 		func(probe ProbeDefinition, res ProbeCallResult, ev *ProbeEvidence) {
 			normText := normalizeBehaviorText(redactExactSecrets(res.Text, target))
 			ev.ObservedText = normText
+			if strings.TrimSpace(normText) == "" {
+				return
+			}
+			validCount++
 
 			var matchRate float64
 			if matchesExpectedFormat(normText, probe.ExpectedFormat) {
@@ -82,13 +87,13 @@ func (d *BehaviorProtocolDetector) ProbeModel(
 		},
 		nil,
 	)
-	if successCount > 0 {
+	if validCount > 0 {
 		reasoningFlag := anyReasoning
 		sig.HasReasoningField = &reasoningFlag
 	}
 	if obs != nil {
 		obs.Behavior = sig
-		obs.Applicable = successCount > 0
+		obs.Applicable = validCount > 0
 	}
 	return obs, err
 }

@@ -1070,3 +1070,52 @@ func TestDiscoverModelsSSRFAndRedaction(t *testing.T) {
 		t.Fatalf("expected invalid proxy scheme error without password leak, got %v", trErr)
 	}
 }
+
+func TestCustomExtraHeadersAlwaysRedacted(t *testing.T) {
+	customPass := "my-custom-pass-99"
+	tenantSecret := "tenant-route-tag-88"
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = fmt.Fprintf(w, `{"error":{"message":"rejected pass=%s route=%s"}}`, r.Header.Get("X-Relay-Pass"), r.Header.Get("X-Tenant-Route"))
+	}))
+	defer srv.Close()
+
+	client := NewHTTPProbeClient(WithAllowLoopbackForTest())
+	target := ProbeTarget{
+		Protocol: ProtocolOpenAIChat,
+		BaseURL:  srv.URL,
+		APIKey:   "sk-primary-1234",
+		ExtraHeaders: map[string]string{
+			"X-Relay-Pass":   customPass,
+			"X-Tenant-Route": tenantSecret,
+		},
+	}
+
+	probeRes := client.ExecuteProbe(context.Background(), target, "gpt-4o", ProbeDefinition{
+		ID:        "lp-1",
+		Kind:      DetectorLogprobs,
+		Prompt:    "hi",
+		MaxTokens: 1,
+	}, true)
+	if probeRes.ErrorCode != errorCodeAuthError {
+		t.Fatalf("expected auth error, got %+v", probeRes)
+	}
+	if strings.Contains(probeRes.ErrorMessage, customPass) || strings.Contains(probeRes.ErrorMessage, tenantSecret) {
+		t.Fatalf("expected custom header values scrubbed from ExecuteProbe error, got %q", probeRes.ErrorMessage)
+	}
+	if !strings.Contains(probeRes.ErrorMessage, "[REDACTED]") {
+		t.Fatalf("expected [REDACTED] marker in ExecuteProbe error, got %q", probeRes.ErrorMessage)
+	}
+
+	_, discErr := client.DiscoverModels(context.Background(), target)
+	if discErr == nil {
+		t.Fatalf("expected DiscoverModels to fail with 401")
+	}
+	if strings.Contains(discErr.Error(), customPass) || strings.Contains(discErr.Error(), tenantSecret) {
+		t.Fatalf("expected custom header values scrubbed from DiscoverModels error, got %v", discErr)
+	}
+	if !strings.Contains(discErr.Error(), "[REDACTED]") {
+		t.Fatalf("expected [REDACTED] marker in DiscoverModels error, got %v", discErr)
+	}
+}

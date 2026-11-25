@@ -513,6 +513,34 @@ func TestVerifyServiceCancelAndModelNormalization(t *testing.T) {
 			TotalModels: 1,
 		})
 		require.NoError(t, err)
+		freshActiveRun, err := store.CreateRun(ctx, Run{
+			TargetSource: TargetSourceAdHoc,
+			TargetLabel:  "fresh-bluegreen-run",
+			Protocol:     ProtocolOpenAIChat,
+			SuiteID:      suite.ID,
+			Status:       RunStatusRunning,
+			TotalModels:  2,
+		})
+		require.NoError(t, err)
+		freshActiveJob, err := store.CreateCaptureJob(ctx, CaptureJob{
+			Status:      RunStatusRunning,
+			Protocol:    ProtocolOpenAIChat,
+			SuiteID:     suite.ID,
+			TotalModels: 1,
+		})
+		require.NoError(t, err)
+
+		staleTimestamp := time.Now().UTC().Add(-defaultStaleJobGracePeriod - time.Minute)
+		store.mu.Lock()
+		for _, id := range []int64{staleQueued.ID, staleRunning.ID} {
+			r := store.runs[id]
+			r.UpdatedAt = staleTimestamp
+			store.runs[id] = r
+		}
+		cj := store.jobs[staleCap.ID]
+		cj.UpdatedAt = staleTimestamp
+		store.jobs[staleCap.ID] = cj
+		store.mu.Unlock()
 
 		resolver := NewTargetResolverWithOptions(
 			&stubAccountLookup{},
@@ -561,6 +589,14 @@ func TestVerifyServiceCancelAndModelNormalization(t *testing.T) {
 		require.NoError(t, err)
 		require.Equal(t, RunStatusFailed, gotCap.Status)
 		require.Equal(t, "server restarted", gotCap.ErrorMessage)
+
+		// Active jobs updated within grace period (blue-green draining instance) stay running.
+		gotFreshRun, err := store.GetRun(ctx, freshActiveRun.ID)
+		require.NoError(t, err)
+		require.Equal(t, RunStatusRunning, gotFreshRun.Status)
+		gotFreshJob, err := store.GetCaptureJob(ctx, freshActiveJob.ID)
+		require.NoError(t, err)
+		require.Equal(t, RunStatusRunning, gotFreshJob.Status)
 
 		// Degraded startup when EnsureSchema fails -> 503 on operations.
 		badDB, badMock, err := sqlmock.New()
@@ -916,4 +952,296 @@ func TestVerifyServiceDiscoverModelsDeleteAndShutdownTimeout(t *testing.T) {
 		require.Error(t, stopErr)
 		require.ErrorIs(t, stopErr, context.DeadlineExceeded)
 	})
+}
+
+func TestVerifyServiceCustomHeadersPrivateSuiteAndLimits(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("redacts_custom_extra_headers_in_discovery_and_run_evidence", func(t *testing.T) {
+		customPass := "my-custom-pass-99"
+		client := &discoverMockProbeClient{
+			mockProbeClient: &mockProbeClient{
+				handler: func(_ context.Context, target ProbeTarget, model string, probe ProbeDefinition, _ bool, _ int) ProbeCallResult {
+					passed := target.ExtraHeaders["X-Relay-Pass"]
+					if model == "fail-model" {
+						return ProbeCallResult{
+							HTTPStatus:   502,
+							ErrorCode:    errorCodeUpstreamError,
+							ErrorMessage: "upstream echoed pass=" + passed,
+						}
+					}
+					return ProbeCallResult{
+						Text:              "text-" + passed,
+						ResponseModel:     "gpt-4o-" + passed,
+						SystemFingerprint: "fp-" + passed,
+						HTTPStatus:        200,
+					}
+				},
+			},
+			discoverFn: func(_ context.Context, target ProbeTarget) ([]string, error) {
+				return nil, fmt.Errorf("upstream bad header %s", target.ExtraHeaders["X-Relay-Pass"])
+			},
+		}
+
+		svc, store := newTestVerifyEnv(t, client, nil, nil)
+		require.NoError(t, svc.Start(ctx))
+		suite := seedMinimalSuite(t, store)
+
+		_, discErr := svc.DiscoverModels(ctx, DiscoverModelsRequest{
+			TargetSource: TargetSourceAdHoc,
+			Protocol:     ProtocolAnthropic,
+			BaseURL:      "https://api.anthropic.com",
+			APIKey:       "sk-custom-hdr-key-1234",
+			ExtraHeaders: map[string]string{"X-Relay-Pass": customPass},
+		})
+		require.Error(t, discErr)
+		require.NotContains(t, discErr.Error(), customPass)
+		require.Contains(t, discErr.Error(), redactedSecretPlaceholder)
+
+		run, err := svc.StartRun(ctx, CreateRunRequest{
+			TargetSource: TargetSourceAdHoc,
+			Protocol:     ProtocolAnthropic,
+			BaseURL:      "https://api.anthropic.com",
+			APIKey:       "sk-custom-hdr-key-1234",
+			ExtraHeaders: map[string]string{"X-Relay-Pass": customPass},
+			SuiteID:      suite.ID,
+			Models:       []string{"claude-sonnet-4-6", "fail-model"},
+		}, 1)
+		require.NoError(t, err)
+
+		done := waitForRunTerminal(t, svc, run.ID)
+		require.Equal(t, RunStatusCompleted, done.Status)
+		raw, err := json.Marshal(done)
+		require.NoError(t, err)
+		require.NotContains(t, string(raw), customPass)
+		require.Contains(t, string(raw), redactedSecretPlaceholder)
+	})
+
+	t.Run("private_suite_strips_observed_and_baseline_text_and_keeps_telemetry", func(t *testing.T) {
+		canaryPrompt := "CANARY_SECRET_PROMPT_XYZ"
+		client := &mockProbeClient{
+			handler: func(_ context.Context, _ ProbeTarget, _ string, probe ProbeDefinition, _ bool, _ int) ProbeCallResult {
+				return ProbeCallResult{
+					Text:               "Answer: " + canaryPrompt,
+					PromptTokens:       42,
+					CachedPromptTokens: 12,
+					OutputTokens:       9,
+					LatencyMS:          88,
+					HTTPStatus:         200,
+				}
+			},
+		}
+		svc, store := newTestVerifyEnv(t, client, nil, nil)
+		require.NoError(t, svc.Start(ctx))
+
+		privSuite, err := store.CreateSuite(ctx, ProbeSuite{
+			SuiteKey:   "priv-canary",
+			Version:    "v1",
+			Name:       "Private Canary",
+			Visibility: VisibilityPrivate,
+			Status:     StatusActive,
+			Probes: []ProbeDefinition{
+				{ID: "bh-priv-1", Kind: DetectorBehavior, Prompt: canaryPrompt, MaxTokens: 32, Weight: 1.0, ExpectedMaxPromptTokens: 500},
+			},
+		})
+		require.NoError(t, err)
+
+		_, err = store.UpsertActiveBaseline(ctx, Baseline{
+			CanonicalModel:   "claude-sonnet-4-6",
+			Protocol:         ProtocolAnthropic,
+			SuiteID:          privSuite.ID,
+			DetectorKind:     DetectorBehavior,
+			SourceType:       SourceOfficialDirect,
+			MatchThreshold:   0.35,
+			SuspectThreshold: 0.55,
+			Behavior: &BehaviorSignature{
+				Probes: map[string]BehaviorProbeSignature{
+					"bh-priv-1": {ProbeID: "bh-priv-1", Samples: []string{"Answer: " + canaryPrompt}},
+				},
+			},
+		})
+		require.NoError(t, err)
+
+		run, err := svc.StartRun(ctx, CreateRunRequest{
+			TargetSource: TargetSourceAdHoc,
+			Protocol:     ProtocolAnthropic,
+			BaseURL:      "https://api.anthropic.com",
+			APIKey:       "sk-priv-suite-key-1234",
+			SuiteID:      privSuite.ID,
+			Models:       []string{"claude-sonnet-4-6"},
+		}, 1)
+		require.NoError(t, err)
+
+		done := waitForRunTerminal(t, svc, run.ID)
+		require.Equal(t, RunStatusCompleted, done.Status)
+		require.Len(t, done.Items, 1)
+		item := done.Items[0]
+		require.Equal(t, VerdictMatch, item.Verdict)
+		require.Greater(t, item.Confidence, 0.0)
+		require.Len(t, item.Evidence, 1)
+		ev := item.Evidence[0]
+		require.Equal(t, "bh-priv-1", ev.ProbeID)
+		require.Equal(t, DetectorBehavior, ev.DetectorKind)
+		require.Equal(t, 42, ev.PromptTokens)
+		require.Equal(t, 12, ev.CachedPromptTokens)
+		require.Equal(t, 88, ev.LatencyMS)
+		require.Empty(t, ev.ObservedText)
+		require.Empty(t, ev.BaselineSampleText)
+
+		persisted, err := store.ListRunItems(ctx, run.ID)
+		require.NoError(t, err)
+		rawItems, err := json.Marshal(persisted)
+		require.NoError(t, err)
+		require.NotContains(t, string(rawItems), canaryPrompt)
+	})
+
+	t.Run("cancel_run_terminal_conflict_in_handle_and_fallback_paths", func(t *testing.T) {
+		svc, store := newTestVerifyEnv(t, nil, nil, nil)
+		require.NoError(t, svc.Start(ctx))
+		suite := seedMinimalSuite(t, store)
+
+		// Handle present + finished == true with Completed status -> 409 MODELFP_RUN_ALREADY_FINISHED.
+		finishedRun, err := store.CreateRun(ctx, Run{
+			TargetSource: TargetSourceAdHoc,
+			TargetLabel:  "finished-in-handle",
+			Protocol:     ProtocolAnthropic,
+			SuiteID:      suite.ID,
+			Status:       RunStatusCompleted,
+			TotalModels:  1,
+		})
+		require.NoError(t, err)
+		svc.verify.mu.Lock()
+		svc.verify.activeRuns[finishedRun.ID] = &activeRunHandle{
+			cancel:   func() {},
+			done:     make(chan struct{}),
+			finished: true,
+			run:      *finishedRun,
+		}
+		svc.verify.mu.Unlock()
+		err = svc.CancelRun(ctx, finishedRun.ID)
+		require.Error(t, err)
+		require.Equal(t, 409, infraerrors.Code(err))
+		require.Equal(t, "MODELFP_RUN_ALREADY_FINISHED", infraerrors.Reason(err))
+		svc.verify.removeActiveRun(finishedRun.ID)
+
+		// Fallback path (handle == nil) when DB row concurrently completes before UpdateRunProgress -> 409.
+		raceBase := NewMemoryStore()
+		raceSuite := seedMinimalSuite(t, raceBase)
+		raceRun, err := raceBase.CreateRun(ctx, Run{
+			TargetSource: TargetSourceAdHoc,
+			TargetLabel:  "race-run",
+			Protocol:     ProtocolAnthropic,
+			SuiteID:      raceSuite.ID,
+			Status:       RunStatusRunning,
+			TotalModels:  1,
+		})
+		require.NoError(t, err)
+
+		racyStore := &completeOnRunUpdateStore{MemoryStore: raceBase}
+		resolver := NewTargetResolverWithOptions(&stubAccountLookup{}, &stubProxyLookup{})
+		orch := NewOrchestrator(&mockProbeClient{})
+		raceSvc := NewService(nil, racyStore, &mockProbeClient{}, resolver, orch, NewBaselineService(racyStore, resolver, orch))
+		require.NoError(t, raceSvc.Start(ctx))
+		t.Cleanup(func() { _ = raceSvc.Stop() })
+
+		// Even with an already-cancelled caller ctx? No, GetRun uses caller ctx, then bounded cleanupCtx finishes/checks conflict;
+		// test normal caller ctx triggering concurrent completion inside UpdateRunProgress.
+		err = raceSvc.CancelRun(ctx, raceRun.ID)
+		require.Error(t, err)
+		require.Equal(t, 409, infraerrors.Code(err))
+		require.Equal(t, "MODELFP_RUN_ALREADY_FINISHED", infraerrors.Reason(err))
+	})
+
+	t.Run("enforces_max_active_verify_runs_limit", func(t *testing.T) {
+		release := make(chan struct{})
+		entered := make(chan struct{}, maxActiveVerifyRuns)
+		client := &mockProbeClient{
+			handler: func(probeCtx context.Context, _ ProbeTarget, _ string, _ ProbeDefinition, _ bool, _ int) ProbeCallResult {
+				select {
+				case <-release:
+					return ProbeCallResult{Text: "ok", HTTPStatus: 200}
+				default:
+				}
+				select {
+				case entered <- struct{}{}:
+				default:
+				}
+				select {
+				case <-release:
+					return ProbeCallResult{Text: "ok", HTTPStatus: 200}
+				case <-probeCtx.Done():
+					return ProbeCallResult{ErrorCode: errorCodeContextCanceled, ErrorMessage: probeCtx.Err().Error()}
+				}
+			},
+		}
+		svc, store := newTestVerifyEnv(t, client, nil, nil)
+		require.NoError(t, svc.Start(ctx))
+		suite := seedMinimalSuite(t, store)
+
+		runIDs := make([]int64, 0, maxActiveVerifyRuns)
+		for i := 0; i < maxActiveVerifyRuns; i++ {
+			run, err := svc.StartRun(ctx, CreateRunRequest{
+				TargetSource: TargetSourceAdHoc,
+				Protocol:     ProtocolAnthropic,
+				BaseURL:      "https://api.anthropic.com",
+				APIKey:       fmt.Sprintf("sk-limit-run-%d-1234", i),
+				SuiteID:      suite.ID,
+				Models:       []string{"claude-sonnet-4-6"},
+			}, 1)
+			require.NoError(t, err)
+			runIDs = append(runIDs, run.ID)
+		}
+		for i := 0; i < maxActiveVerifyRuns; i++ {
+			<-entered
+		}
+
+		_, err := svc.StartRun(ctx, CreateRunRequest{
+			TargetSource: TargetSourceAdHoc,
+			Protocol:     ProtocolAnthropic,
+			BaseURL:      "https://api.anthropic.com",
+			APIKey:       "sk-limit-run-over-1234",
+			SuiteID:      suite.ID,
+			Models:       []string{"claude-sonnet-4-6"},
+		}, 1)
+		require.Error(t, err)
+		require.Equal(t, 429, infraerrors.Code(err))
+		require.Equal(t, "MODELFP_TOO_MANY_ACTIVE_JOBS", infraerrors.Reason(err))
+
+		page, err := svc.ListRuns(ctx, 1, 20)
+		require.NoError(t, err)
+		require.Equal(t, int64(maxActiveVerifyRuns), page.Total)
+
+		close(release)
+		for _, id := range runIDs {
+			waitForRunTerminal(t, svc, id)
+		}
+
+		// Once active runs complete, another run is allowed.
+		nextRun, err := svc.StartRun(ctx, CreateRunRequest{
+			TargetSource: TargetSourceAdHoc,
+			Protocol:     ProtocolAnthropic,
+			BaseURL:      "https://api.anthropic.com",
+			APIKey:       "sk-limit-run-after-1234",
+			SuiteID:      suite.ID,
+			Models:       []string{"claude-sonnet-4-6"},
+		}, 1)
+		require.NoError(t, err)
+		done := waitForRunTerminal(t, svc, nextRun.ID)
+		require.Equal(t, RunStatusCompleted, done.Status)
+	})
+}
+
+type completeOnRunUpdateStore struct {
+	*MemoryStore
+}
+
+func (c *completeOnRunUpdateStore) UpdateRunProgress(ctx context.Context, run Run) error {
+	now := time.Now().UTC()
+	_ = c.MemoryStore.UpdateRunProgress(ctx, Run{
+		ID:              run.ID,
+		Status:          RunStatusCompleted,
+		CompletedModels: 1,
+		FinishedAt:      &now,
+	})
+	return c.MemoryStore.UpdateRunProgress(ctx, run)
 }

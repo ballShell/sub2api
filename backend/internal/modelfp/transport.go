@@ -1379,7 +1379,7 @@ func collectSecrets(target ProbeTarget) []string {
 		addVariant(s)
 		trimmed := strings.TrimSpace(s)
 		addVariant(trimmed)
-		if len(trimmed) >= 4 {
+		if len(trimmed) >= 3 {
 			addVariant(url.QueryEscape(trimmed))
 		}
 		if rawJSON, err := json.Marshal(trimmed); err == nil && len(rawJSON) >= 2 {
@@ -1406,17 +1406,9 @@ func collectSecrets(target ProbeTarget) []string {
 			}
 		}
 	}
-	for k, v := range target.ExtraHeaders {
-		lower := strings.ToLower(strings.TrimSpace(k))
-		if strings.Contains(lower, "auth") ||
-			strings.Contains(lower, "key") ||
-			strings.Contains(lower, "token") ||
-			strings.Contains(lower, "secret") ||
-			strings.Contains(lower, "cookie") ||
-			strings.Contains(lower, "pass") {
-			if len(strings.TrimSpace(v)) >= 4 {
-				addWithEncodings(v)
-			}
+	for _, v := range target.ExtraHeaders {
+		if len(strings.TrimSpace(v)) >= 3 {
+			addWithEncodings(v)
 		}
 	}
 

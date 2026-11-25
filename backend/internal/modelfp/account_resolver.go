@@ -249,7 +249,7 @@ func (r *TargetResolver) ResolveAccount(ctx context.Context, accountID int64, pr
 	defaultModels := resolveAccountDefaultModels(platform, modelMapping)
 
 	accIDCopy := account.ID
-	label := formatAccountLabel(account.ID, account.Name, apiKey, proxyPassword)
+	label := formatAccountLabel(account.ID, account.Name, apiKey, proxyPassword, headers)
 
 	return &ResolvedTarget{
 		Target: ProbeTarget{
@@ -689,27 +689,28 @@ func resolveModelMappingMatch(mapping map[string]string, model string) (string, 
 	return matches[0].target, true
 }
 
-func formatAccountLabel(accountID int64, rawName, apiKey, proxyPassword string) string {
-	clean := sanitizeLabelText(rawName, apiKey, proxyPassword)
+func formatAccountLabel(accountID int64, rawName, apiKey, proxyPassword string, extraHeaders map[string]string) string {
+	clean := sanitizeLabelText(rawName, apiKey, proxyPassword, extraHeaders)
 	if clean == "" {
 		return fmt.Sprintf("account #%d", accountID)
 	}
 	return fmt.Sprintf("account #%d (%s)", accountID, clean)
 }
 
-func sanitizeLabelText(raw, apiKey, proxyPassword string) string {
+func sanitizeLabelText(raw, apiKey, proxyPassword string, extraHeaders map[string]string) string {
 	s := strings.NewReplacer("\r", " ", "\n", " ", "\t", " ").Replace(raw)
 	s = strings.TrimSpace(s)
 	if s == "" {
 		return ""
 	}
-	for _, secret := range []string{strings.TrimSpace(apiKey), strings.TrimSpace(proxyPassword)} {
-		if secret != "" {
-			s = strings.ReplaceAll(s, secret, redactedSecretPlaceholder)
-		}
+	target := ProbeTarget{
+		APIKey:       apiKey,
+		ExtraHeaders: extraHeaders,
 	}
-	s = bearerTokenPattern.ReplaceAllString(s, "Bearer "+redactedSecretPlaceholder)
-	s = apiKeyTokenPattern.ReplaceAllString(s, redactedSecretPlaceholder)
+	s = redactExactSecrets(s, target)
+	if pw := strings.TrimSpace(proxyPassword); pw != "" {
+		s = strings.ReplaceAll(s, pw, redactedSecretPlaceholder)
+	}
 	return strings.TrimSpace(s)
 }
 

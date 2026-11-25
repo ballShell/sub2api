@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math"
 	"net/http"
+	"regexp"
 	"sort"
 	"strings"
 	"time"
@@ -461,7 +462,8 @@ func adjudicateVerification(
 		!strings.EqualFold(candidates[0].CanonicalModel, canonicalModel) &&
 		candidates[0].Distance < claimedDist
 
-	if claimedDist > claimedMatchThr || peerAmbiguous || lostTopSpot {
+	injectionDowngrade := detector.Kind() == DetectorBehavior && out.PromptInjectionSuspected
+	if claimedDist > claimedMatchThr || peerAmbiguous || lostTopSpot || injectionDowngrade {
 		out.Verdict = VerdictSuspect
 		out.Confidence = computeVerdictConfidence(VerdictSuspect, detector.Kind(), claimedDist, claimedMatchThr, claimedSuspectThr, out.UsedStaleBaseline, out.PromptInjectionSuspected)
 		return out
@@ -554,7 +556,7 @@ func enrichEvidenceWithBaseline(evidence []ProbeEvidence, kind DetectorKind, obs
 				continue
 			}
 			bestSample, bestDist := closestSample(obsProbe.Samples[0], baseProbe.Samples)
-			evidence[i].BaselineSampleText = bestSample
+			evidence[i].BaselineSampleText = normalizeBehaviorText(bestSample)
 			evidence[i].Distance = bestDist
 		}
 	}
@@ -1017,4 +1019,49 @@ func computeRoundSelfDivP95(detector Detector, model string, protocol Protocol, 
 		}
 	}
 	return ComputeSelfDivergenceP95(distances)
+}
+
+func buildPrivatePromptScrubber(suite ProbeSuite) func(string) string {
+	if suite.Visibility != VisibilityPrivate || len(suite.Probes) == 0 {
+		return nil
+	}
+	seen := make(map[string]struct{}, len(suite.Probes)*2)
+	variants := make([]string, 0, len(suite.Probes)*2)
+	addVariant := func(v string) {
+		if v == "" {
+			return
+		}
+		lower := strings.ToLower(v)
+		if _, ok := seen[lower]; ok {
+			return
+		}
+		seen[lower] = struct{}{}
+		variants = append(variants, v)
+	}
+	for _, p := range suite.Probes {
+		trimmed := strings.TrimSpace(p.Prompt)
+		addVariant(trimmed)
+		addVariant(strings.ReplaceAll(trimmed, "\r\n", "\n"))
+		addVariant(normalizeBehaviorText(p.Prompt))
+	}
+	if len(variants) == 0 {
+		return nil
+	}
+	sort.Slice(variants, func(i, j int) bool {
+		return len(variants[i]) > len(variants[j])
+	})
+	patterns := make([]*regexp.Regexp, 0, len(variants))
+	for _, v := range variants {
+		patterns = append(patterns, regexp.MustCompile("(?i)"+regexp.QuoteMeta(v)))
+	}
+	return func(s string) string {
+		if s == "" {
+			return ""
+		}
+		out := s
+		for _, re := range patterns {
+			out = re.ReplaceAllString(out, redactedSecretPlaceholder)
+		}
+		return out
+	}
 }

@@ -27,12 +27,14 @@ type Service struct {
 	baselines *BaselineService
 	verify    *VerifyService
 
-	startOnce       sync.Once
-	lifecycleMu     sync.Mutex
-	initErr         error
-	ready           atomic.Bool
-	stopped         atomic.Bool
-	shutdownTimeout time.Duration
+	startOnce           sync.Once
+	lifecycleMu         sync.Mutex
+	initErr             error
+	ready               atomic.Bool
+	stopped             atomic.Bool
+	shutdownTimeout     time.Duration
+	staleJobGracePeriod time.Duration
+	now                 func() time.Time
 }
 
 // NewService constructs the modelfp Service facade injected into cmd/server.Application.
@@ -45,13 +47,15 @@ func NewService(
 	baselines *BaselineService,
 ) *Service {
 	return &Service{
-		db:              db,
-		store:           store,
-		client:          client,
-		resolver:        resolver,
-		baselines:       baselines,
-		verify:          NewVerifyService(store, resolver, orchestrator),
-		shutdownTimeout: defaultServiceShutdownTimeout,
+		db:                  db,
+		store:               store,
+		client:              client,
+		resolver:            resolver,
+		baselines:           baselines,
+		verify:              NewVerifyService(store, resolver, orchestrator),
+		shutdownTimeout:     defaultServiceShutdownTimeout,
+		staleJobGracePeriod: defaultStaleJobGracePeriod,
+		now:                 func() time.Time { return time.Now().UTC() },
 	}
 }
 
@@ -99,10 +103,22 @@ func (s *Service) init(ctx context.Context) error {
 			return fmt.Errorf("ensure modelfp seeds: %w", err)
 		}
 	}
-	if err := s.store.MarkStaleRunningJobsFailed(ctx, defaultRestartReason); err != nil {
+	grace := s.staleJobGracePeriod
+	if grace < 0 {
+		grace = 0
+	}
+	staleBefore := s.currentTime().Add(-grace)
+	if err := s.store.MarkStaleRunningJobsFailedBefore(ctx, staleBefore, defaultRestartReason); err != nil {
 		return fmt.Errorf("mark stale running jobs failed: %w", err)
 	}
 	return nil
+}
+
+func (s *Service) currentTime() time.Time {
+	if s != nil && s.now != nil {
+		return s.now().UTC()
+	}
+	return time.Now().UTC()
 }
 
 // Stop cancels all active verification runs and baseline capture jobs and waits

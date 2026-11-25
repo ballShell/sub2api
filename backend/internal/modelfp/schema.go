@@ -90,11 +90,14 @@ const (
 		started_at       TIMESTAMPTZ,
 		finished_at      TIMESTAMPTZ,
 		created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+		updated_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 		CONSTRAINT chk_modelfp_runs_target_source CHECK (target_source IN ('adhoc', 'account')),
 		CONSTRAINT chk_modelfp_runs_protocol CHECK (protocol IN ('openai_chat', 'openai_responses', 'anthropic', 'gemini')),
 		CONSTRAINT chk_modelfp_runs_status CHECK (status IN ('queued', 'running', 'completed', 'cancelled', 'failed')),
 		CONSTRAINT chk_modelfp_runs_summary_json CHECK (jsonb_typeof(summary_json) = 'object')
 	)`
+
+	ddlAlterRunsAddUpdatedAt = `ALTER TABLE modelfp_runs ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()`
 
 	ddlCreateRunsCreatedIndex = `CREATE INDEX IF NOT EXISTS idx_modelfp_runs_created
 		ON modelfp_runs (created_at DESC, id DESC)`
@@ -143,12 +146,15 @@ const (
 		error_message    TEXT NOT NULL DEFAULT '',
 		created_by       BIGINT NOT NULL DEFAULT 0,
 		created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+		updated_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 		finished_at      TIMESTAMPTZ,
 		CONSTRAINT chk_modelfp_capture_jobs_status CHECK (status IN ('queued', 'running', 'completed', 'cancelled', 'failed')),
 		CONSTRAINT chk_modelfp_capture_jobs_protocol CHECK (protocol IN ('openai_chat', 'openai_responses', 'anthropic', 'gemini')),
 		CONSTRAINT chk_modelfp_capture_jobs_source_type CHECK (source_type IN ('official_direct', 'trusted_cloud', 'cross_verified', 'community_seed')),
 		CONSTRAINT chk_modelfp_capture_jobs_results_json CHECK (jsonb_typeof(results_json) = 'array')
 	)`
+
+	ddlAlterCaptureJobsAddUpdatedAt = `ALTER TABLE modelfp_capture_jobs ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()`
 
 	ddlCreateCaptureJobsStatusIndex = `CREATE INDEX IF NOT EXISTS idx_modelfp_capture_jobs_status
 		ON modelfp_capture_jobs (status, created_at DESC)`
@@ -165,11 +171,13 @@ func SchemaStatements() []string {
 		ddlCreateBaselinesModelIndex,
 		ddlCreateFamilyMaps,
 		ddlCreateRuns,
+		ddlAlterRunsAddUpdatedAt,
 		ddlCreateRunsCreatedIndex,
 		ddlCreateRunsStatusIndex,
 		ddlCreateRunItems,
 		ddlCreateRunItemsRunIndex,
 		ddlCreateCaptureJobs,
+		ddlAlterCaptureJobsAddUpdatedAt,
 		ddlCreateCaptureJobsStatusIndex,
 	}
 }

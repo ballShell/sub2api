@@ -17,6 +17,7 @@ const (
 	minVerifyConcurrency     = 1
 	maxVerifyConcurrency     = 5
 	maxVerifyModels          = 50
+	maxActiveVerifyRuns      = 3
 	maxRunLabelChars         = 255
 	verifyCleanupTimeout     = 5 * time.Second
 	cancelWaitTimeout        = 200 * time.Millisecond
@@ -90,13 +91,14 @@ type VerifyService struct {
 	resolver     *TargetResolver
 	orchestrator *Orchestrator
 
-	mu         sync.Mutex
-	stopped    bool
-	baseCtx    context.Context
-	cancel     context.CancelFunc
-	wg         sync.WaitGroup
-	activeRuns map[int64]*activeRunHandle
-	now        func() time.Time
+	mu             sync.Mutex
+	stopped        bool
+	baseCtx        context.Context
+	cancel         context.CancelFunc
+	wg             sync.WaitGroup
+	activeRuns     map[int64]*activeRunHandle
+	inFlightStarts int
+	now            func() time.Time
 }
 
 // NewVerifyService constructs a VerifyService backed by Store, TargetResolver, and Orchestrator.
@@ -162,9 +164,16 @@ func (s *VerifyService) StartRun(ctx context.Context, req CreateRunRequest, admi
 
 	s.mu.Lock()
 	stopped := s.stopped
+	tooMany := len(s.activeRuns)+s.inFlightStarts >= maxActiveVerifyRuns
 	s.mu.Unlock()
 	if stopped {
 		return nil, infraerrors.ServiceUnavailable("MODELFP_SERVICE_STOPPED", "verification service is shutting down")
+	}
+	if tooMany {
+		return nil, infraerrors.TooManyRequests(
+			"MODELFP_TOO_MANY_ACTIVE_JOBS",
+			fmt.Sprintf("too many active verification runs (limit %d)", maxActiveVerifyRuns),
+		)
 	}
 
 	models, err := normalizeVerifyModels(req.Models)
@@ -210,9 +219,30 @@ func (s *VerifyService) StartRun(ctx context.Context, req CreateRunRequest, admi
 		s.mu.Unlock()
 		return nil, infraerrors.ServiceUnavailable("MODELFP_SERVICE_STOPPED", "verification service is shutting down")
 	}
+	if len(s.activeRuns)+s.inFlightStarts >= maxActiveVerifyRuns {
+		s.mu.Unlock()
+		return nil, infraerrors.TooManyRequests(
+			"MODELFP_TOO_MANY_ACTIVE_JOBS",
+			fmt.Sprintf("too many active verification runs (limit %d)", maxActiveVerifyRuns),
+		)
+	}
+	s.inFlightStarts++
 	runCtx, runCancel := context.WithCancel(s.baseCtx)
 	s.wg.Add(1)
 	s.mu.Unlock()
+
+	registered := false
+	defer func() {
+		if !registered {
+			s.mu.Lock()
+			if s.inFlightStarts > 0 {
+				s.inFlightStarts--
+			}
+			s.mu.Unlock()
+			runCancel()
+			s.wg.Done()
+		}
+	}()
 
 	created, err := s.store.CreateRun(ctx, Run{
 		TargetSource:    resolved.Target.Source,
@@ -227,8 +257,6 @@ func (s *VerifyService) StartRun(ctx context.Context, req CreateRunRequest, admi
 		CreatedBy:       adminID,
 	})
 	if err != nil {
-		runCancel()
-		s.wg.Done()
 		return nil, err
 	}
 
@@ -248,12 +276,14 @@ func (s *VerifyService) StartRun(ctx context.Context, req CreateRunRequest, admi
 		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), verifyCleanupTimeout)
 		_ = s.store.UpdateRunProgress(cleanupCtx, *created)
 		cleanupCancel()
-		runCancel()
 		close(handle.done)
-		s.wg.Done()
 		return nil, infraerrors.ServiceUnavailable("MODELFP_SERVICE_STOPPED", "verification service is shutting down")
 	}
 	s.activeRuns[created.ID] = handle
+	if s.inFlightStarts > 0 {
+		s.inFlightStarts--
+	}
+	registered = true
 	s.mu.Unlock()
 
 	go s.executeRun(runCtx, handle, resolved, *suite, models, concurrency)
@@ -321,7 +351,20 @@ func (s *VerifyService) CancelRun(ctx context.Context, runID int64) error {
 	s.mu.Unlock()
 
 	if handle != nil {
-		handle.cancelled.Store(true)
+		handle.mu.Lock()
+		if handle.finished {
+			status := handle.run.Status
+			handle.mu.Unlock()
+			switch status {
+			case RunStatusCancelled:
+				return nil
+			case RunStatusCompleted, RunStatusFailed:
+				return finishedRunConflictError(runID, status)
+			}
+		} else {
+			handle.cancelled.Store(true)
+			handle.mu.Unlock()
+		}
 		handle.cancel()
 
 		waitTimer := time.NewTimer(cancelWaitTimeout)
@@ -329,6 +372,12 @@ func (s *VerifyService) CancelRun(ctx context.Context, runID int64) error {
 
 		select {
 		case <-handle.done:
+			handle.mu.Lock()
+			status := handle.run.Status
+			handle.mu.Unlock()
+			if status == RunStatusCompleted || status == RunStatusFailed {
+				return finishedRunConflictError(runID, status)
+			}
 			return nil
 		case <-ctx.Done():
 			return ctx.Err()
@@ -343,14 +392,19 @@ func (s *VerifyService) CancelRun(ctx context.Context, runID int64) error {
 				handle.run.FinishedAt = &now
 				cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), verifyCleanupTimeout)
 				err := s.store.UpdateRunProgress(cleanupCtx, handle.run)
-				cleanupCancel()
 				if err == nil {
 					handle.finished = true
 				}
 				handle.mu.Unlock()
+				err = s.resolveTerminalCancelResult(cleanupCtx, runID, err)
+				cleanupCancel()
 				return err
 			}
+			status := handle.run.Status
 			handle.mu.Unlock()
+			if status == RunStatusCompleted || status == RunStatusFailed {
+				return finishedRunConflictError(runID, status)
+			}
 			return nil
 		}
 	}
@@ -363,10 +417,7 @@ func (s *VerifyService) CancelRun(ctx context.Context, runID int64) error {
 	case RunStatusCancelled:
 		return nil
 	case RunStatusCompleted, RunStatusFailed:
-		return infraerrors.Conflict(
-			"MODELFP_RUN_ALREADY_FINISHED",
-			fmt.Sprintf("run #%d already finished with status %s", runID, run.Status),
-		)
+		return finishedRunConflictError(runID, run.Status)
 	default:
 		now := s.currentTime()
 		run.Status = RunStatusCancelled
@@ -374,7 +425,38 @@ func (s *VerifyService) CancelRun(ctx context.Context, runID int64) error {
 			run.ErrorMessage = "run cancelled"
 		}
 		run.FinishedAt = &now
-		return s.store.UpdateRunProgress(ctx, *run)
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), verifyCleanupTimeout)
+		defer cleanupCancel()
+		err := s.store.UpdateRunProgress(cleanupCtx, *run)
+		return s.resolveTerminalCancelResult(cleanupCtx, runID, err)
+	}
+}
+
+func finishedRunConflictError(runID int64, status RunStatus) error {
+	return infraerrors.Conflict(
+		"MODELFP_RUN_ALREADY_FINISHED",
+		fmt.Sprintf("run #%d already finished with status %s", runID, status),
+	)
+}
+
+func (s *VerifyService) resolveTerminalCancelResult(cleanupCtx context.Context, runID int64, updateErr error) error {
+	if updateErr == nil {
+		return nil
+	}
+	if !errors.Is(updateErr, ErrNotFound) {
+		return updateErr
+	}
+	latest, getErr := s.store.GetRun(cleanupCtx, runID)
+	if getErr != nil {
+		return getErr
+	}
+	switch latest.Status {
+	case RunStatusCancelled:
+		return nil
+	case RunStatusCompleted, RunStatusFailed:
+		return finishedRunConflictError(runID, latest.Status)
+	default:
+		return updateErr
 	}
 }
 
@@ -427,6 +509,8 @@ func (s *VerifyService) executeRun(
 		close(handle.done)
 	}()
 
+	promptScrubber := buildPrivatePromptScrubber(suite)
+
 	finalize := func(status RunStatus, errMsg string) {
 		handle.mu.Lock()
 		defer handle.mu.Unlock()
@@ -435,7 +519,7 @@ func (s *VerifyService) executeRun(
 		}
 		now := s.currentTime()
 		handle.run.Status = status
-		handle.run.ErrorMessage = redactSecrets(errMsg, resolved.Target)
+		handle.run.ErrorMessage = scrubOptionalText(redactSecrets(errMsg, resolved.Target), promptScrubber)
 		handle.run.FinishedAt = &now
 		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), verifyCleanupTimeout)
 		defer cleanupCancel()
@@ -555,7 +639,7 @@ func (s *VerifyService) executeRun(
 					})
 					item = out.ToRunItem(handle.run.ID)
 				}
-				item = sanitizeRunItemSecrets(item, resolved.Target)
+				item = sanitizeRunItemForSuite(item, resolved.Target, suite, promptScrubber)
 
 				handle.mu.Lock()
 				if handle.cancelled.Load() || ctx.Err() != nil || handle.finished {
@@ -736,38 +820,51 @@ func applyItemToSummary(summary *RunSummary, item RunItem) {
 	}
 }
 
-func sanitizeRunItemSecrets(item RunItem, target ProbeTarget) RunItem {
-	item.ClaimedModel = redactExactSecrets(item.ClaimedModel, target)
-	item.UpstreamModel = redactExactSecrets(item.UpstreamModel, target)
-	item.CanonicalModel = redactExactSecrets(item.CanonicalModel, target)
-	item.ErrorCode = redactExactSecrets(item.ErrorCode, target)
-	item.ErrorMessage = redactSecrets(item.ErrorMessage, target)
+func sanitizeRunItemForSuite(item RunItem, target ProbeTarget, suite ProbeSuite, promptScrubber func(string) string) RunItem {
+	item.ClaimedModel = scrubOptionalText(redactExactSecrets(item.ClaimedModel, target), promptScrubber)
+	item.UpstreamModel = scrubOptionalText(redactExactSecrets(item.UpstreamModel, target), promptScrubber)
+	item.CanonicalModel = scrubOptionalText(redactExactSecrets(item.CanonicalModel, target), promptScrubber)
+	item.ErrorCode = scrubOptionalText(redactExactSecrets(item.ErrorCode, target), promptScrubber)
+	item.ErrorMessage = scrubOptionalText(redactSecrets(item.ErrorMessage, target), promptScrubber)
 
 	if len(item.TopCandidates) == 0 {
 		item.TopCandidates = []CandidateScore{}
 	} else {
 		cleanCandidates := make([]CandidateScore, len(item.TopCandidates))
 		for i, cand := range item.TopCandidates {
-			cand.CanonicalModel = redactExactSecrets(cand.CanonicalModel, target)
+			cand.CanonicalModel = scrubOptionalText(redactExactSecrets(cand.CanonicalModel, target), promptScrubber)
 			cleanCandidates[i] = cand
 		}
 		item.TopCandidates = cleanCandidates
 	}
 
+	isPrivateSuite := suite.Visibility == VisibilityPrivate
 	if len(item.Evidence) == 0 {
 		item.Evidence = []ProbeEvidence{}
 	} else {
 		cleanEvidence := make([]ProbeEvidence, len(item.Evidence))
 		for i, ev := range item.Evidence {
-			ev.ProbeID = redactExactSecrets(ev.ProbeID, target)
-			ev.ResponseModel = redactExactSecrets(ev.ResponseModel, target)
-			ev.SystemFingerprint = redactExactSecrets(ev.SystemFingerprint, target)
-			ev.ObservedText = redactExactSecrets(ev.ObservedText, target)
-			ev.BaselineSampleText = redactExactSecrets(ev.BaselineSampleText, target)
-			ev.ErrorCode = redactExactSecrets(ev.ErrorCode, target)
-			ev.ErrorMessage = redactSecretsWithStatus(ev.ErrorMessage, ev.HTTPStatus, target)
-			ev.ObservedTopTokens = sanitizeTokenProbSlice(ev.ObservedTopTokens, target)
-			ev.BaselineTopTokens = sanitizeTokenProbSlice(ev.BaselineTopTokens, target)
+			ev.ProbeID = scrubOptionalText(redactExactSecrets(ev.ProbeID, target), promptScrubber)
+			ev.ResponseModel = scrubOptionalText(redactExactSecrets(ev.ResponseModel, target), promptScrubber)
+			ev.SystemFingerprint = scrubOptionalText(redactExactSecrets(ev.SystemFingerprint, target), promptScrubber)
+			if isPrivateSuite {
+				// Private canary suites must never persist raw prompts or model text echoes.
+				ev.ObservedText = ""
+				ev.BaselineSampleText = ""
+			} else {
+				ev.ObservedText = redactExactSecrets(ev.ObservedText, target)
+				if ev.ObservedText != "" {
+					ev.ObservedText = normalizeBehaviorText(ev.ObservedText)
+				}
+				ev.BaselineSampleText = redactExactSecrets(ev.BaselineSampleText, target)
+				if ev.BaselineSampleText != "" {
+					ev.BaselineSampleText = normalizeBehaviorText(ev.BaselineSampleText)
+				}
+			}
+			ev.ErrorCode = scrubOptionalText(redactExactSecrets(ev.ErrorCode, target), promptScrubber)
+			ev.ErrorMessage = scrubOptionalText(redactSecretsWithStatus(ev.ErrorMessage, ev.HTTPStatus, target), promptScrubber)
+			ev.ObservedTopTokens = sanitizeTokenProbSlice(ev.ObservedTopTokens, target, promptScrubber)
+			ev.BaselineTopTokens = sanitizeTokenProbSlice(ev.BaselineTopTokens, target, promptScrubber)
 			cleanEvidence[i] = ev
 		}
 		item.Evidence = cleanEvidence
@@ -776,13 +873,20 @@ func sanitizeRunItemSecrets(item RunItem, target ProbeTarget) RunItem {
 	return item
 }
 
-func sanitizeTokenProbSlice(tokens []TokenProb, target ProbeTarget) []TokenProb {
+func scrubOptionalText(s string, scrubber func(string) string) string {
+	if s == "" || scrubber == nil {
+		return s
+	}
+	return scrubber(s)
+}
+
+func sanitizeTokenProbSlice(tokens []TokenProb, target ProbeTarget, promptScrubber func(string) string) []TokenProb {
 	if len(tokens) == 0 {
 		return nil
 	}
 	out := make([]TokenProb, len(tokens))
 	for i, tp := range tokens {
-		tp.Token = redactExactSecrets(tp.Token, target)
+		tp.Token = scrubOptionalText(redactExactSecrets(tp.Token, target), promptScrubber)
 		out[i] = tp
 	}
 	return out

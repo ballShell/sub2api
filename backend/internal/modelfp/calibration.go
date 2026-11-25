@@ -18,11 +18,12 @@ const (
 	logprobsDefMatch   = 0.08
 	logprobsDefSuspect = 0.18
 
-	behaviorEpsMin     = 0.12
-	behaviorEpsMax     = 0.38
-	behaviorSuspectCap = 0.60
-	behaviorDefMatch   = 0.18
-	behaviorDefSuspect = 0.32
+	behaviorEpsMin         = 0.12
+	behaviorEpsMax         = 0.38
+	behaviorSuspectCap     = 0.60
+	behaviorDefMatch       = 0.18
+	behaviorDefSuspect     = 0.32
+	maxBehaviorSampleRunes = 2048
 )
 
 // NormalizeTokenDistribution normalizes top-k token probabilities into a probability map
@@ -217,7 +218,8 @@ func BehaviorResponseDistance(a, b string) float64 {
 
 func normalizeBehaviorText(s string) string {
 	s = strings.ReplaceAll(s, "\r\n", "\n")
-	return strings.TrimSpace(s)
+	s = strings.TrimSpace(s)
+	return strings.TrimSpace(truncateRunes(s, maxBehaviorSampleRunes))
 }
 
 func runeLevenshtein(a, b []rune) int {

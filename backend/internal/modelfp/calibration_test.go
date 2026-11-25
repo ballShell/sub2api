@@ -347,3 +347,16 @@ func TestErrorSentinelsAndSecretRedaction(t *testing.T) {
 		}
 	}
 }
+
+func TestBehaviorResponseDistanceCapsSampleLength(t *testing.T) {
+	prefix := strings.Repeat("a", maxBehaviorSampleRunes)
+	a := prefix + strings.Repeat("b", 400)
+	b := prefix + strings.Repeat("c", 400)
+	if dist := BehaviorResponseDistance(a, b); dist != 0 {
+		t.Fatalf("expected samples differing only past maxBehaviorSampleRunes (%d) to have distance 0, got %v", maxBehaviorSampleRunes, dist)
+	}
+	c := strings.Repeat("a", maxBehaviorSampleRunes-1) + "z"
+	if dist := BehaviorResponseDistance(a, c); dist <= 0 {
+		t.Fatalf("expected samples differing within maxBehaviorSampleRunes to have positive distance, got %v", dist)
+	}
+}

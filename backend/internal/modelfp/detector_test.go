@@ -372,8 +372,8 @@ func TestOrchestratorFallbackPreservesInjectionWarning(t *testing.T) {
 	if out.DetectorUsed != DetectorBehavior {
 		t.Fatalf("expected fallback to DetectorBehavior, got %s", out.DetectorUsed)
 	}
-	if out.Verdict != VerdictMatch {
-		t.Fatalf("expected VerdictMatch against behavior baseline, got %s (%+v)", out.Verdict, out)
+	if out.Verdict != VerdictSuspect {
+		t.Fatalf("expected VerdictSuspect when behavior fallback carries prompt injection warning, got %s (%+v)", out.Verdict, out)
 	}
 	if !out.PromptInjectionSuspected {
 		t.Fatalf("expected PromptInjectionSuspected=true to be preserved across fallback")
@@ -445,8 +445,8 @@ func TestOrchestratorFallbackWhenNoClaimedLogprobsBaseline(t *testing.T) {
 		Baselines:    baselines,
 	})
 
-	if out.DetectorUsed != DetectorBehavior || out.Verdict != VerdictMatch {
-		t.Fatalf("expected DetectorBehavior VerdictMatch, got detector=%s verdict=%s", out.DetectorUsed, out.Verdict)
+	if out.DetectorUsed != DetectorBehavior || out.Verdict != VerdictSuspect {
+		t.Fatalf("expected DetectorBehavior VerdictSuspect under injection warning, got detector=%s verdict=%s", out.DetectorUsed, out.Verdict)
 	}
 	if !out.PromptInjectionSuspected || out.ObservedPromptTokens != 700 {
 		t.Fatalf("expected CachedPromptTokens=700 to trigger injection warning, got injected=%v tokens=%d", out.PromptInjectionSuspected, out.ObservedPromptTokens)
@@ -1267,8 +1267,8 @@ func TestOrchestratorErrorShapedUnsupportedLogprobsFallback(t *testing.T) {
 			Baselines:    baselines,
 		})
 
-		if out.Verdict != VerdictMatch {
-			t.Fatalf("expected VerdictMatch via behavior fallback, got %s (err=%s: %s)", out.Verdict, out.ErrorCode, out.ErrorMessage)
+		if out.Verdict != VerdictSuspect {
+			t.Fatalf("expected VerdictSuspect via behavior fallback under injection warning, got %s (err=%s: %s)", out.Verdict, out.ErrorCode, out.ErrorMessage)
 		}
 		if out.DetectorUsed != DetectorBehavior {
 			t.Fatalf("expected DetectorBehavior, got %s", out.DetectorUsed)
@@ -1506,6 +1506,139 @@ func TestOrchestratorSkipsNonComparableBaselinesInTopCandidates(t *testing.T) {
 		}
 		if len(out.TopCandidates) != 0 {
 			t.Fatalf("expected empty TopCandidates when no baselines are comparable, got %+v", out.TopCandidates)
+		}
+	})
+}
+
+func TestBehaviorEmptyOutputInjectionDowngradeAndSampleCap(t *testing.T) {
+	suite := ProbeSuite{
+		ID:         77,
+		SuiteKey:   "behavior-edge",
+		Version:    "v1",
+		Visibility: VisibilityPublic,
+		Status:     StatusActive,
+		Probes: []ProbeDefinition{
+			{ID: "lp-1", Kind: DetectorLogprobs, Prompt: "Sky", MaxTokens: 1, Weight: 1.0, ExpectedMaxPromptTokens: 500},
+			{ID: "bh-1", Kind: DetectorBehavior, Prompt: "Compute", MaxTokens: 32, Weight: 1.0, ExpectedMaxPromptTokens: 500},
+			{ID: "bh-2", Kind: DetectorBehavior, Prompt: "Count", MaxTokens: 16, Weight: 1.0, ExpectedMaxPromptTokens: 500},
+		},
+	}
+
+	target := ProbeTarget{Protocol: ProtocolAnthropic, BaseURL: "https://api.anthropic.com", APIKey: "sk-ant-test"}
+	bhDet := NewBehaviorProtocolDetector()
+
+	t.Run("all empty HTTP 200 behavior responses produce Applicable=false and VerdictUnverified", func(t *testing.T) {
+		client := &mockProbeClient{
+			handler: func(_ context.Context, _ ProbeTarget, _ string, _ ProbeDefinition, _ bool, _ int) ProbeCallResult {
+				return ProbeCallResult{Text: "  \r\n  ", HTTPStatus: 200, PromptTokens: 20}
+			},
+		}
+
+		obs, err := bhDet.ProbeModel(context.Background(), client, target, "claude-sonnet-4-6", suite)
+		if err != nil {
+			t.Fatalf("unexpected error for empty HTTP 200 output: %v", err)
+		}
+		if obs == nil || obs.Applicable {
+			t.Fatalf("expected Applicable=false when all behavior probes return empty trimmed text, got %+v", obs)
+		}
+		if len(obs.Behavior.Probes) != 0 {
+			t.Fatalf("expected no behavior probe samples stored for empty outputs, got %+v", obs.Behavior.Probes)
+		}
+
+		baselines := []Baseline{
+			{
+				ID:               1,
+				CanonicalModel:   "claude-sonnet-4-6",
+				Protocol:         ProtocolAnthropic,
+				SuiteID:          suite.ID,
+				DetectorKind:     DetectorBehavior,
+				Status:           StatusActive,
+				MatchThreshold:   0.18,
+				SuspectThreshold: 0.32,
+				Behavior: &BehaviorSignature{
+					Probes: map[string]BehaviorProbeSignature{
+						"bh-1": {ProbeID: "bh-1", Samples: []string{"non-empty"}},
+					},
+				},
+			},
+		}
+		out := NewOrchestrator(client).VerifyModel(context.Background(), VerifyModelInput{
+			Target:       target,
+			ClaimedModel: "claude-sonnet-4-6",
+			Suite:        suite,
+			Baselines:    baselines,
+		})
+		if out.Verdict != VerdictUnverified {
+			t.Fatalf("expected VerdictUnverified when upstream returns only empty behavior text, got %s", out.Verdict)
+		}
+	})
+
+	t.Run("mixed empty and non-empty keeps valid probe and caps sample to maxBehaviorSampleRunes", func(t *testing.T) {
+		longText := strings.Repeat("x", maxBehaviorSampleRunes+400)
+		client := &mockProbeClient{
+			handler: func(_ context.Context, _ ProbeTarget, _ string, probe ProbeDefinition, _ bool, _ int) ProbeCallResult {
+				if probe.ID == "bh-1" {
+					return ProbeCallResult{Text: "   ", HTTPStatus: 200}
+				}
+				return ProbeCallResult{Text: longText, HTTPStatus: 200}
+			},
+		}
+
+		obs, err := bhDet.ProbeModel(context.Background(), client, target, "claude-sonnet-4-6", suite)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if !obs.Applicable {
+			t.Fatalf("expected Applicable=true when at least one probe returns non-empty text")
+		}
+		if _, hasEmpty := obs.Behavior.Probes["bh-1"]; hasEmpty {
+			t.Fatalf("did not expect empty probe bh-1 in BehaviorSignature.Probes")
+		}
+		got := obs.Behavior.Probes["bh-2"].Samples[0]
+		if len([]rune(got)) != maxBehaviorSampleRunes {
+			t.Fatalf("expected capped %d runes, got %d", maxBehaviorSampleRunes, len([]rune(got)))
+		}
+	})
+
+	t.Run("logprobs match stays VerdictMatch when PromptInjectionSuspected=true", func(t *testing.T) {
+		lpBaselines := []Baseline{
+			{
+				ID:               2,
+				CanonicalModel:   "gpt-4o",
+				Protocol:         ProtocolOpenAIChat,
+				SuiteID:          suite.ID,
+				DetectorKind:     DetectorLogprobs,
+				Status:           StatusActive,
+				MatchThreshold:   0.08,
+				SuspectThreshold: 0.18,
+				Logprobs: &LogprobsSignature{
+					Probes: map[string]LogprobsProbeSignature{
+						"lp-1": {ProbeID: "lp-1", Distribution: map[string]float64{"sky": 1.0}},
+					},
+				},
+			},
+		}
+		client := &mockProbeClient{
+			handler: func(_ context.Context, _ ProbeTarget, _ string, _ ProbeDefinition, _ bool, _ int) ProbeCallResult {
+				return ProbeCallResult{
+					Logprobs:          []TokenProb{{Token: "sky", Prob: 1.0}},
+					LogprobsSupported: true,
+					PromptTokens:      999, // > 500 triggers PromptInjectionSuspected
+					HTTPStatus:        200,
+				}
+			},
+		}
+		out := NewOrchestrator(client).VerifyModel(context.Background(), VerifyModelInput{
+			Target:       ProbeTarget{Protocol: ProtocolOpenAIChat, BaseURL: "https://api.example.com/v1", APIKey: "sk-key"},
+			ClaimedModel: "gpt-4o",
+			Suite:        suite,
+			Baselines:    lpBaselines,
+		})
+		if !out.PromptInjectionSuspected {
+			t.Fatalf("expected PromptInjectionSuspected=true")
+		}
+		if out.DetectorUsed != DetectorLogprobs || out.Verdict != VerdictMatch {
+			t.Fatalf("expected DetectorLogprobs match not downgraded by injection, got detector=%s verdict=%s", out.DetectorUsed, out.Verdict)
 		}
 	})
 }

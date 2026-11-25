@@ -15,11 +15,12 @@ import (
 )
 
 const (
-	defaultBaselineTTLDays = 60
-	defaultCaptureJobRound = 3
-	defaultRestartReason   = "server restarted"
-	defaultRunPageSize     = 20
-	maxRunPageSize         = 100
+	defaultBaselineTTLDays     = 60
+	defaultCaptureJobRound     = 3
+	defaultRestartReason       = "server restarted"
+	defaultRunPageSize         = 20
+	maxRunPageSize             = 100
+	defaultStaleJobGracePeriod = 5 * time.Minute
 )
 
 // BaselineFilter specifies optional filter predicates when listing baselines.
@@ -51,12 +52,14 @@ type Store interface {
 	UpdateSuiteStatus(ctx context.Context, id int64, status Status, isDefault bool) (*ProbeSuite, error)
 
 	UpsertActiveBaseline(ctx context.Context, baseline Baseline) (*Baseline, error)
+	UpsertActiveBaselinesAtomic(ctx context.Context, baselines []Baseline) ([]Baseline, error)
 	ListBaselines(ctx context.Context, filter BaselineFilter) ([]Baseline, error)
 	GetBaseline(ctx context.Context, id int64) (*Baseline, error)
 	UpdateBaseline(ctx context.Context, id int64, update BaselineUpdate) (*Baseline, error)
 	DeleteBaseline(ctx context.Context, id int64) error
 
 	UpsertFamilyMap(ctx context.Context, fm FamilyMap) (*FamilyMap, error)
+	InsertSeedFamilyMapIfMissing(ctx context.Context, fm FamilyMap) error
 	ListFamilyMaps(ctx context.Context) ([]FamilyMap, error)
 	DeleteFamilyMap(ctx context.Context, canonicalModel string) error
 
@@ -73,6 +76,7 @@ type Store interface {
 	GetCaptureJob(ctx context.Context, id int64) (*CaptureJob, error)
 
 	MarkStaleRunningJobsFailed(ctx context.Context, reason string) error
+	MarkStaleRunningJobsFailedBefore(ctx context.Context, staleBefore time.Time, reason string) error
 }
 
 // PostgresStore implements Store using parameterized PostgreSQL queries over *sql.DB.
@@ -291,12 +295,36 @@ func (s *PostgresStore) UpdateSuiteStatus(ctx context.Context, id int64, status 
 }
 
 func (s *PostgresStore) UpsertActiveBaseline(ctx context.Context, baseline Baseline) (*Baseline, error) {
+	saved, err := s.UpsertActiveBaselinesAtomic(ctx, []Baseline{baseline})
+	if err != nil {
+		return nil, err
+	}
+	if len(saved) == 0 {
+		return nil, errors.New("upsert baseline produced no rows")
+	}
+	out := saved[0]
+	return &out, nil
+}
+
+func (s *PostgresStore) UpsertActiveBaselinesAtomic(ctx context.Context, baselines []Baseline) ([]Baseline, error) {
 	if err := s.ensureDB(); err != nil {
 		return nil, err
 	}
-	norm, sigJSON, err := normalizeBaselineForWrite(baseline)
-	if err != nil {
-		return nil, err
+	if len(baselines) == 0 {
+		return []Baseline{}, nil
+	}
+
+	type preparedBaseline struct {
+		norm    Baseline
+		sigJSON []byte
+	}
+	prepared := make([]preparedBaseline, len(baselines))
+	for i, baseline := range baselines {
+		norm, sigJSON, err := normalizeBaselineForWrite(baseline)
+		if err != nil {
+			return nil, err
+		}
+		prepared[i] = preparedBaseline{norm: norm, sigJSON: sigJSON}
 	}
 
 	tx, err := s.db.BeginTx(ctx, nil)
@@ -305,6 +333,22 @@ func (s *PostgresStore) UpsertActiveBaseline(ctx context.Context, baseline Basel
 	}
 	defer func() { _ = tx.Rollback() }()
 
+	savedList := make([]Baseline, 0, len(prepared))
+	for _, item := range prepared {
+		saved, upsertErr := upsertActiveBaselineInTx(ctx, tx, item.norm, item.sigJSON)
+		if upsertErr != nil {
+			return nil, upsertErr
+		}
+		savedList = append(savedList, *saved)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return savedList, nil
+}
+
+func upsertActiveBaselineInTx(ctx context.Context, tx *sql.Tx, norm Baseline, sigJSON []byte) (*Baseline, error) {
 	if _, err := tx.ExecContext(ctx, `
 		UPDATE modelfp_baselines
 		SET status = 'archived', updated_at = NOW()
@@ -347,10 +391,6 @@ func (s *PostgresStore) UpsertActiveBaseline(ctx context.Context, baseline Basel
 	}
 	if saved.SuiteVersion == "" {
 		saved.SuiteVersion = norm.SuiteVersion
-	}
-
-	if err := tx.Commit(); err != nil {
-		return nil, err
 	}
 	return saved, nil
 }
@@ -552,13 +592,10 @@ func (s *PostgresStore) DeleteBaseline(ctx context.Context, id int64) error {
 	return requireAffectedRow(res, err)
 }
 
-func (s *PostgresStore) UpsertFamilyMap(ctx context.Context, fm FamilyMap) (*FamilyMap, error) {
-	if err := s.ensureDB(); err != nil {
-		return nil, err
-	}
+func marshalFamilyMap(fm FamilyMap) (string, string, []byte, []byte, error) {
 	canon := strings.TrimSpace(fm.CanonicalModel)
 	if canon == "" {
-		return nil, errors.New("canonical_model is required")
+		return "", "", nil, nil, errors.New("canonical_model is required")
 	}
 	aliases := fm.Aliases
 	if aliases == nil {
@@ -570,11 +607,22 @@ func (s *PostgresStore) UpsertFamilyMap(ctx context.Context, fm FamilyMap) (*Fam
 	}
 	aliasesJSON, err := json.Marshal(aliases)
 	if err != nil {
-		return nil, fmt.Errorf("marshal family map aliases: %w", err)
+		return "", "", nil, nil, fmt.Errorf("marshal family map aliases: %w", err)
 	}
 	peersJSON, err := json.Marshal(peers)
 	if err != nil {
-		return nil, fmt.Errorf("marshal family map confusion peers: %w", err)
+		return "", "", nil, nil, fmt.Errorf("marshal family map confusion peers: %w", err)
+	}
+	return canon, strings.TrimSpace(fm.Family), aliasesJSON, peersJSON, nil
+}
+
+func (s *PostgresStore) UpsertFamilyMap(ctx context.Context, fm FamilyMap) (*FamilyMap, error) {
+	if err := s.ensureDB(); err != nil {
+		return nil, err
+	}
+	canon, family, aliasesJSON, peersJSON, err := marshalFamilyMap(fm)
+	if err != nil {
+		return nil, err
 	}
 
 	row := s.db.QueryRowContext(ctx, `
@@ -587,9 +635,27 @@ func (s *PostgresStore) UpsertFamilyMap(ctx context.Context, fm FamilyMap) (*Fam
 			confusion_peers_json = EXCLUDED.confusion_peers_json,
 			updated_at = NOW()
 		RETURNING canonical_model, family, aliases_json, confusion_peers_json, updated_at
-	`, canon, strings.TrimSpace(fm.Family), aliasesJSON, peersJSON)
+	`, canon, family, aliasesJSON, peersJSON)
 
 	return scanFamilyMap(row)
+}
+
+func (s *PostgresStore) InsertSeedFamilyMapIfMissing(ctx context.Context, fm FamilyMap) error {
+	if err := s.ensureDB(); err != nil {
+		return err
+	}
+	canon, family, aliasesJSON, peersJSON, err := marshalFamilyMap(fm)
+	if err != nil {
+		return err
+	}
+
+	_, err = s.db.ExecContext(ctx, `
+		INSERT INTO modelfp_family_maps (
+			canonical_model, family, aliases_json, confusion_peers_json, updated_at
+		) VALUES ($1, $2, $3::jsonb, $4::jsonb, NOW())
+		ON CONFLICT (canonical_model) DO NOTHING
+	`, canon, family, aliasesJSON, peersJSON)
+	return err
 }
 
 func (s *PostgresStore) ListFamilyMaps(ctx context.Context) ([]FamilyMap, error) {
@@ -644,15 +710,15 @@ func (s *PostgresStore) CreateRun(ctx context.Context, run Run) (*Run, error) {
 		INSERT INTO modelfp_runs (
 			target_source, account_id, target_label, protocol, suite_id,
 			status, total_models, completed_models, summary_json,
-			error_message, created_by, started_at, finished_at, created_at
+			error_message, created_by, started_at, finished_at, created_at, updated_at
 		) VALUES (
 			$1, $2, $3, $4, $5,
 			$6, $7, $8, $9::jsonb,
-			$10, $11, $12, $13, NOW()
+			$10, $11, $12, $13, NOW(), NOW()
 		)
 		RETURNING id, target_source, account_id, target_label, protocol, suite_id,
 		          status, total_models, completed_models, summary_json,
-		          error_message, created_by, started_at, finished_at, created_at
+		          error_message, created_by, started_at, finished_at, created_at, updated_at
 	`, string(run.TargetSource), nullableInt64Arg(run.AccountID), run.TargetLabel, string(run.Protocol), run.SuiteID,
 		string(run.Status), run.TotalModels, run.CompletedModels, summaryJSON,
 		run.ErrorMessage, run.CreatedBy, nullableTimeArg(run.StartedAt), nullableTimeArg(run.FinishedAt))
@@ -675,8 +741,10 @@ func (s *PostgresStore) UpdateRunProgress(ctx context.Context, run Run) error {
 		    summary_json = $4::jsonb,
 		    error_message = $5,
 		    started_at = COALESCE($6, started_at),
-		    finished_at = COALESCE($7, finished_at)
+		    finished_at = COALESCE($7, finished_at),
+		    updated_at = NOW()
 		WHERE id = $1
+		  AND status NOT IN ('completed', 'cancelled', 'failed')
 	`, run.ID, string(run.Status), run.CompletedModels, summaryJSON, run.ErrorMessage,
 		nullableTimeArg(run.StartedAt), nullableTimeArg(run.FinishedAt))
 	return requireAffectedRow(res, err)
@@ -689,7 +757,7 @@ func (s *PostgresStore) GetRun(ctx context.Context, id int64) (*Run, error) {
 	row := s.db.QueryRowContext(ctx, `
 		SELECT id, target_source, account_id, target_label, protocol, suite_id,
 		       status, total_models, completed_models, summary_json,
-		       error_message, created_by, started_at, finished_at, created_at
+		       error_message, created_by, started_at, finished_at, created_at, updated_at
 		FROM modelfp_runs
 		WHERE id = $1
 	`, id)
@@ -725,7 +793,7 @@ func (s *PostgresStore) ListRuns(ctx context.Context, page, pageSize int) (*RunP
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT id, target_source, account_id, target_label, protocol, suite_id,
 		       status, total_models, completed_models, summary_json,
-		       error_message, created_by, started_at, finished_at, created_at
+		       error_message, created_by, started_at, finished_at, created_at, updated_at
 		FROM modelfp_runs
 		ORDER BY created_at DESC, id DESC
 		LIMIT $1 OFFSET $2
@@ -863,15 +931,15 @@ func (s *PostgresStore) CreateCaptureJob(ctx context.Context, job CaptureJob) (*
 		INSERT INTO modelfp_capture_jobs (
 			status, protocol, suite_id, source_type, sample_rounds,
 			total_models, completed_models, results_json, error_message,
-			created_by, created_at, finished_at
+			created_by, created_at, updated_at, finished_at
 		) VALUES (
 			$1, $2, $3, $4, $5,
 			$6, $7, $8::jsonb, $9,
-			$10, NOW(), $11
+			$10, NOW(), NOW(), $11
 		)
 		RETURNING id, status, protocol, suite_id, source_type, sample_rounds,
 		          total_models, completed_models, results_json, error_message,
-		          created_by, created_at, finished_at
+		          created_by, created_at, updated_at, finished_at
 	`, string(job.Status), string(job.Protocol), job.SuiteID, string(job.SourceType), job.SampleRounds,
 		job.TotalModels, job.CompletedModels, resultsJSON, job.ErrorMessage,
 		job.CreatedBy, nullableTimeArg(job.FinishedAt))
@@ -897,8 +965,10 @@ func (s *PostgresStore) UpdateCaptureJob(ctx context.Context, job CaptureJob) er
 		    completed_models = $3,
 		    results_json = $4::jsonb,
 		    error_message = $5,
-		    finished_at = COALESCE($6, finished_at)
+		    finished_at = COALESCE($6, finished_at),
+		    updated_at = NOW()
 		WHERE id = $1
+		  AND status NOT IN ('completed', 'cancelled', 'failed')
 	`, job.ID, string(job.Status), job.CompletedModels, resultsJSON, job.ErrorMessage, nullableTimeArg(job.FinishedAt))
 	return requireAffectedRow(res, err)
 }
@@ -910,7 +980,7 @@ func (s *PostgresStore) GetCaptureJob(ctx context.Context, id int64) (*CaptureJo
 	row := s.db.QueryRowContext(ctx, `
 		SELECT id, status, protocol, suite_id, source_type, sample_rounds,
 		       total_models, completed_models, results_json, error_message,
-		       created_by, created_at, finished_at
+		       created_by, created_at, updated_at, finished_at
 		FROM modelfp_capture_jobs
 		WHERE id = $1
 	`, id)
@@ -922,12 +992,21 @@ func (s *PostgresStore) GetCaptureJob(ctx context.Context, id int64) (*CaptureJo
 }
 
 func (s *PostgresStore) MarkStaleRunningJobsFailed(ctx context.Context, reason string) error {
+	return s.MarkStaleRunningJobsFailedBefore(ctx, time.Now().UTC().Add(-defaultStaleJobGracePeriod), reason)
+}
+
+func (s *PostgresStore) MarkStaleRunningJobsFailedBefore(ctx context.Context, staleBefore time.Time, reason string) error {
 	if err := s.ensureDB(); err != nil {
 		return err
 	}
 	reason = strings.TrimSpace(reason)
 	if reason == "" {
 		reason = defaultRestartReason
+	}
+	if staleBefore.IsZero() {
+		staleBefore = time.Now().UTC().Add(-defaultStaleJobGracePeriod)
+	} else {
+		staleBefore = staleBefore.UTC()
 	}
 
 	tx, err := s.db.BeginTx(ctx, nil)
@@ -940,9 +1019,11 @@ func (s *PostgresStore) MarkStaleRunningJobsFailed(ctx context.Context, reason s
 		UPDATE modelfp_runs
 		SET status = 'failed',
 		    error_message = $1,
-		    finished_at = NOW()
+		    finished_at = NOW(),
+		    updated_at = NOW()
 		WHERE status IN ('queued', 'running')
-	`, reason); err != nil {
+		  AND updated_at < $2
+	`, reason, staleBefore); err != nil {
 		return err
 	}
 
@@ -950,9 +1031,11 @@ func (s *PostgresStore) MarkStaleRunningJobsFailed(ctx context.Context, reason s
 		UPDATE modelfp_capture_jobs
 		SET status = 'failed',
 		    error_message = $1,
-		    finished_at = NOW()
+		    finished_at = NOW(),
+		    updated_at = NOW()
 		WHERE status IN ('queued', 'running')
-	`, reason); err != nil {
+		  AND updated_at < $2
+	`, reason, staleBefore); err != nil {
 		return err
 	}
 
@@ -1181,7 +1264,7 @@ func scanRun(row sqlScanner) (*Run, error) {
 	err := row.Scan(
 		&r.ID, &src, &accountID, &r.TargetLabel, &proto, &r.SuiteID,
 		&status, &r.TotalModels, &r.CompletedModels, &summaryRaw,
-		&r.ErrorMessage, &createdBy, &startedAt, &finishedAt, &r.CreatedAt,
+		&r.ErrorMessage, &createdBy, &startedAt, &finishedAt, &r.CreatedAt, &r.UpdatedAt,
 	)
 	if err != nil {
 		return nil, err
@@ -1252,7 +1335,7 @@ func scanCaptureJob(row sqlScanner) (*CaptureJob, error) {
 	err := row.Scan(
 		&job.ID, &status, &proto, &job.SuiteID, &srcType, &job.SampleRounds,
 		&job.TotalModels, &job.CompletedModels, &resultsRaw, &job.ErrorMessage,
-		&createdBy, &job.CreatedAt, &finishedAt,
+		&createdBy, &job.CreatedAt, &job.UpdatedAt, &finishedAt,
 	)
 	if err != nil {
 		return nil, err
@@ -1336,4 +1419,8 @@ func normalizePagination(page, pageSize int) (int, int) {
 		pageSize = maxRunPageSize
 	}
 	return page, pageSize
+}
+
+func isTerminalRunStatus(status RunStatus) bool {
+	return status == RunStatusCompleted || status == RunStatusCancelled || status == RunStatusFailed
 }

@@ -309,6 +309,7 @@ type Run struct {
 	StartedAt       *time.Time   `json:"started_at,omitempty"`
 	FinishedAt      *time.Time   `json:"finished_at,omitempty"`
 	CreatedAt       time.Time    `json:"created_at"`
+	UpdatedAt       time.Time    `json:"updated_at,omitempty"`
 }
 
 // RunItem represents the verification verdict and evidence for one model in a Run.
@@ -376,6 +377,7 @@ type CaptureJob struct {
 	ErrorMessage    string               `json:"error_message,omitempty"`
 	CreatedBy       int64                `json:"created_by,omitempty"`
 	CreatedAt       time.Time            `json:"created_at"`
+	UpdatedAt       time.Time            `json:"updated_at,omitempty"`
 	FinishedAt      *time.Time           `json:"finished_at,omitempty"`
 }
 

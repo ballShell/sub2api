@@ -18,6 +18,7 @@ const (
 	minCaptureSampleRounds = 3
 	maxCaptureSampleRounds = 5
 	maxCaptureModels       = 20
+	maxActiveCaptureJobs   = 2
 	maxBaselineLabelChars  = 255
 	captureCleanupTimeout  = 5 * time.Second
 )
@@ -107,12 +108,13 @@ type BaselineService struct {
 	resolver     *TargetResolver
 	orchestrator *Orchestrator
 
-	mu      sync.Mutex
-	stopped bool
-	baseCtx context.Context
-	cancel  context.CancelFunc
-	wg      sync.WaitGroup
-	now     func() time.Time
+	mu         sync.Mutex
+	stopped    bool
+	baseCtx    context.Context
+	cancel     context.CancelFunc
+	wg         sync.WaitGroup
+	activeJobs int
+	now        func() time.Time
 }
 
 // NewBaselineService constructs a BaselineService backed by Store, TargetResolver, and Orchestrator.
@@ -173,8 +175,8 @@ func (s *BaselineService) EnsureSeeds(ctx context.Context) error {
 		}
 	}
 	for _, fm := range families {
-		if _, err := s.store.UpsertFamilyMap(ctx, fm); err != nil {
-			return fmt.Errorf("upsert seed family map %s: %w", fm.CanonicalModel, err)
+		if err := s.store.InsertSeedFamilyMapIfMissing(ctx, fm); err != nil {
+			return fmt.Errorf("seed family map %s: %w", fm.CanonicalModel, err)
 		}
 	}
 	return nil
@@ -281,9 +283,16 @@ func (s *BaselineService) StartCaptureJob(ctx context.Context, req CaptureReques
 
 	s.mu.Lock()
 	stopped := s.stopped
+	tooMany := s.activeJobs >= maxActiveCaptureJobs
 	s.mu.Unlock()
 	if stopped {
 		return nil, infraerrors.ServiceUnavailable("MODELFP_SERVICE_STOPPED", "baseline service is shutting down")
+	}
+	if tooMany {
+		return nil, infraerrors.TooManyRequests(
+			"MODELFP_TOO_MANY_ACTIVE_JOBS",
+			fmt.Sprintf("too many active baseline capture jobs (limit %d)", maxActiveCaptureJobs),
+		)
 	}
 
 	rounds, err := normalizeCaptureRounds(req.SampleRounds)
@@ -333,9 +342,30 @@ func (s *BaselineService) StartCaptureJob(ctx context.Context, req CaptureReques
 		s.mu.Unlock()
 		return nil, infraerrors.ServiceUnavailable("MODELFP_SERVICE_STOPPED", "baseline service is shutting down")
 	}
+	if s.activeJobs >= maxActiveCaptureJobs {
+		s.mu.Unlock()
+		return nil, infraerrors.TooManyRequests(
+			"MODELFP_TOO_MANY_ACTIVE_JOBS",
+			fmt.Sprintf("too many active baseline capture jobs (limit %d)", maxActiveCaptureJobs),
+		)
+	}
+	s.activeJobs++
 	jobCtx, jobCancel := context.WithCancel(s.baseCtx)
 	s.wg.Add(1)
 	s.mu.Unlock()
+
+	handedOff := false
+	defer func() {
+		if !handedOff {
+			jobCancel()
+			s.mu.Lock()
+			if s.activeJobs > 0 {
+				s.activeJobs--
+			}
+			s.mu.Unlock()
+			s.wg.Done()
+		}
+	}()
 
 	created, err := s.store.CreateCaptureJob(ctx, CaptureJob{
 		Status:          RunStatusQueued,
@@ -349,13 +379,14 @@ func (s *BaselineService) StartCaptureJob(ctx context.Context, req CaptureReques
 		CreatedBy:       adminID,
 	})
 	if err != nil {
-		jobCancel()
-		s.wg.Done()
 		return nil, err
 	}
 
 	s.mu.Lock()
 	stoppedNow := s.stopped
+	if !stoppedNow {
+		handedOff = true
+	}
 	s.mu.Unlock()
 	if stoppedNow {
 		now := s.currentTime()
@@ -365,8 +396,6 @@ func (s *BaselineService) StartCaptureJob(ctx context.Context, req CaptureReques
 		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), captureCleanupTimeout)
 		_ = s.store.UpdateCaptureJob(cleanupCtx, *created)
 		cleanupCancel()
-		jobCancel()
-		s.wg.Done()
 		return nil, infraerrors.ServiceUnavailable("MODELFP_SERVICE_STOPPED", "baseline service is shutting down")
 	}
 
@@ -410,12 +439,21 @@ func (s *BaselineService) runCaptureJob(
 	notes string,
 ) {
 	defer s.wg.Done()
+	defer func() {
+		s.mu.Lock()
+		if s.activeJobs > 0 {
+			s.activeJobs--
+		}
+		s.mu.Unlock()
+	}()
 	defer cancel()
+
+	promptScrubber := buildPrivatePromptScrubber(suite)
 
 	persistFinal := func(status RunStatus, errMsg string) {
 		now := s.currentTime()
 		job.Status = status
-		job.ErrorMessage = redactSecrets(errMsg, resolved.Target)
+		job.ErrorMessage = scrubOptionalText(redactSecrets(errMsg, resolved.Target), promptScrubber)
 		job.FinishedAt = &now
 
 		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), captureCleanupTimeout)
@@ -488,20 +526,20 @@ func (s *BaselineService) runCaptureJob(
 				persistFinal(RunStatusCancelled, "capture cancelled")
 				return
 			}
-			safeErr := redactSecrets(capErr.Error(), resolved.Target)
+			safeErr := scrubOptionalText(redactSecrets(capErr.Error(), resolved.Target), promptScrubber)
 			res.Error = safeErr
 			if firstErrMsg == "" {
 				firstErrMsg = safeErr
 			}
 		} else {
-			cleanBehavior := sanitizeCapturedBehaviorSignature(samples.AggregatedBehavior, resolved.Target)
+			cleanBehavior := sanitizeCapturedBehaviorSignature(samples.AggregatedBehavior, resolved.Target, promptScrubber)
 			cleanLogprobs := sanitizeCapturedLogprobsSignature(samples.AggregatedLogprobs, resolved.Target)
 
 			snapshot := snapshotOverride
 			if snapshot == "" && cleanBehavior != nil && len(cleanBehavior.ResponseModels) > 0 {
-				snapshot = truncateRunes(redactSecrets(cleanBehavior.ResponseModels[0], resolved.Target), maxBaselineLabelChars)
+				snapshot = truncateRunes(scrubOptionalText(redactSecrets(cleanBehavior.ResponseModels[0], resolved.Target), promptScrubber), maxBaselineLabelChars)
 			}
-			snapshot = truncateRunes(redactSecrets(snapshot, resolved.Target), maxBaselineLabelChars)
+			snapshot = truncateRunes(scrubOptionalText(redactSecrets(snapshot, resolved.Target), promptScrubber), maxBaselineLabelChars)
 
 			if cleanBehavior == nil {
 				safeErr := "missing behavior signature for baseline capture"
@@ -510,9 +548,12 @@ func (s *BaselineService) runCaptureJob(
 					firstErrMsg = safeErr
 				}
 			} else {
-				logprobsOK := true
+				plans := make([]capturedBaselinePlan, 0, 2)
+				toCommit := make([]Baseline, 0, 2)
+				var prepErr error
+
 				if samples.LogprobsSupported && cleanLogprobs != nil {
-					lpID, selfDiv, nearDist, overlap, detail, saveErr := s.persistCapturedBaseline(
+					plan, err := s.prepareCapturedBaseline(
 						ctx,
 						canonicalModel,
 						resolved.Target.Protocol,
@@ -528,26 +569,16 @@ func (s *BaselineService) runCaptureJob(
 						ttlDays,
 						notes,
 					)
-					if saveErr != nil {
-						logprobsOK = false
-						safeErr := redactSecrets(saveErr.Error(), resolved.Target)
-						res.Error = safeErr
-						if firstErrMsg == "" {
-							firstErrMsg = safeErr
-						}
+					if err != nil {
+						prepErr = err
 					} else {
-						res.LogprobsBaselineID = &lpID
-						res.LogprobsSelfDivP95 = &selfDiv
-						res.LogprobsNearestDist = nearDist
-						if overlap {
-							res.OverlapWarning = true
-							res.OverlapDetails = append(res.OverlapDetails, redactSecrets(detail, resolved.Target))
-						}
+						plans = append(plans, plan)
+						toCommit = append(toCommit, plan.baseline)
 					}
 				}
 
-				if logprobsOK {
-					bhID, selfDiv, nearDist, overlap, detail, saveErr := s.persistCapturedBaseline(
+				if prepErr == nil {
+					plan, err := s.prepareCapturedBaseline(
 						ctx,
 						canonicalModel,
 						resolved.Target.Protocol,
@@ -563,19 +594,48 @@ func (s *BaselineService) runCaptureJob(
 						ttlDays,
 						notes,
 					)
+					if err != nil {
+						prepErr = err
+					} else {
+						plans = append(plans, plan)
+						toCommit = append(toCommit, plan.baseline)
+					}
+				}
+
+				if prepErr != nil {
+					safeErr := scrubOptionalText(redactSecrets(prepErr.Error(), resolved.Target), promptScrubber)
+					res.Error = safeErr
+					if firstErrMsg == "" {
+						firstErrMsg = safeErr
+					}
+				} else {
+					saved, saveErr := s.store.UpsertActiveBaselinesAtomic(ctx, toCommit)
 					if saveErr != nil {
-						safeErr := redactSecrets(saveErr.Error(), resolved.Target)
+						safeErr := scrubOptionalText(redactSecrets(saveErr.Error(), resolved.Target), promptScrubber)
 						res.Error = safeErr
 						if firstErrMsg == "" {
 							firstErrMsg = safeErr
 						}
 					} else {
-						res.BehaviorBaselineID = &bhID
-						res.BehaviorSelfDivP95 = &selfDiv
-						res.BehaviorNearestDist = nearDist
-						if overlap {
-							res.OverlapWarning = true
-							res.OverlapDetails = append(res.OverlapDetails, redactSecrets(detail, resolved.Target))
+						for i, b := range saved {
+							id := b.ID
+							plan := plans[i]
+							switch b.DetectorKind {
+							case DetectorLogprobs:
+								selfDiv := plan.selfDivP95
+								res.LogprobsBaselineID = &id
+								res.LogprobsSelfDivP95 = &selfDiv
+								res.LogprobsNearestDist = plan.nearestDist
+							case DetectorBehavior:
+								selfDiv := plan.selfDivP95
+								res.BehaviorBaselineID = &id
+								res.BehaviorSelfDivP95 = &selfDiv
+								res.BehaviorNearestDist = plan.nearestDist
+							}
+							if plan.overlap {
+								res.OverlapWarning = true
+								res.OverlapDetails = append(res.OverlapDetails, scrubOptionalText(redactSecrets(plan.overlapDetail, resolved.Target), promptScrubber))
+							}
 						}
 						succeededCount++
 					}
@@ -605,7 +665,15 @@ func (s *BaselineService) runCaptureJob(
 	persistFinal(RunStatusCompleted, "")
 }
 
-func (s *BaselineService) persistCapturedBaseline(
+type capturedBaselinePlan struct {
+	baseline      Baseline
+	selfDivP95    float64
+	nearestDist   *float64
+	overlap       bool
+	overlapDetail string
+}
+
+func (s *BaselineService) prepareCapturedBaseline(
 	ctx context.Context,
 	canonicalModel string,
 	protocol Protocol,
@@ -620,7 +688,7 @@ func (s *BaselineService) persistCapturedBaseline(
 	behaviorSig *BehaviorSignature,
 	ttlDays int,
 	notes string,
-) (int64, float64, *float64, bool, string, error) {
+) (capturedBaselinePlan, error) {
 	peers, err := s.store.ListBaselines(ctx, BaselineFilter{
 		Protocol:     protocol,
 		SuiteID:      suite.ID,
@@ -628,7 +696,7 @@ func (s *BaselineService) persistCapturedBaseline(
 		Status:       StatusActive,
 	})
 	if err != nil {
-		return 0, 0, nil, false, "", fmt.Errorf("list peer baselines: %w", err)
+		return capturedBaselinePlan{}, fmt.Errorf("list peer baselines: %w", err)
 	}
 
 	candidate := Baseline{
@@ -657,7 +725,7 @@ func (s *BaselineService) persistCapturedBaseline(
 		)
 	}
 
-	saved, err := s.store.UpsertActiveBaseline(ctx, Baseline{
+	baseline := Baseline{
 		CanonicalModel:    canonicalModel,
 		Protocol:          protocol,
 		SuiteID:           suite.ID,
@@ -677,12 +745,15 @@ func (s *BaselineService) persistCapturedBaseline(
 		Status:            StatusActive,
 		Notes:             notes,
 		CollectedAt:       s.currentTime(),
-	})
-	if err != nil {
-		return 0, 0, nil, false, "", fmt.Errorf("save %s baseline: %w", kind, err)
 	}
 
-	return saved.ID, selfDivP95, nearDist, overlap, overlapDetail, nil
+	return capturedBaselinePlan{
+		baseline:      baseline,
+		selfDivP95:    selfDivP95,
+		nearestDist:   nearDist,
+		overlap:       overlap,
+		overlapDetail: overlapDetail,
+	}, nil
 }
 
 // ConfusionMatrix computes the symmetric pairwise distance matrix and close-pair warnings
@@ -1014,6 +1085,9 @@ func (s *BaselineService) ImportBundle(ctx context.Context, req ImportBundleRequ
 		toSave.SuiteKey = targetSuite.SuiteKey
 		toSave.SuiteVersion = targetSuite.Version
 		toSave.Status = StatusActive
+		if toSave.Behavior != nil {
+			toSave.Behavior = capBehaviorSignatureSamples(toSave.Behavior)
+		}
 		if _, err := s.store.UpsertActiveBaseline(ctx, toSave); err != nil {
 			return nil, err
 		}
@@ -1782,27 +1856,58 @@ func sanitizeCapturedLogprobsSignature(sig *LogprobsSignature, target ProbeTarge
 	return out
 }
 
-func sanitizeCapturedBehaviorSignature(sig *BehaviorSignature, target ProbeTarget) *BehaviorSignature {
+func sanitizeCapturedBehaviorSignature(sig *BehaviorSignature, target ProbeTarget, promptScrubber func(string) string) *BehaviorSignature {
+	return transformBehaviorSignatureSamples(sig, func(s string) string {
+		return scrubOptionalText(redactExactSecrets(s, target), promptScrubber)
+	}, true)
+}
+
+func capBehaviorSignatureSamples(sig *BehaviorSignature) *BehaviorSignature {
+	return transformBehaviorSignatureSamples(sig, nil, false)
+}
+
+func transformBehaviorSignatureSamples(
+	sig *BehaviorSignature,
+	redactFn func(string) string,
+	dedupeMeta bool,
+) *BehaviorSignature {
 	if sig == nil {
 		return nil
 	}
 	out := &BehaviorSignature{
-		Probes:             make(map[string]BehaviorProbeSignature, len(sig.Probes)),
-		ResponseModels:     redactDistinctSlice(sig.ResponseModels, target),
-		SystemFingerprints: redactDistinctSlice(sig.SystemFingerprints, target),
+		Probes: make(map[string]BehaviorProbeSignature, len(sig.Probes)),
+	}
+	if dedupeMeta {
+		out.ResponseModels = sanitizeDistinctSlice(sig.ResponseModels, redactFn)
+		out.SystemFingerprints = sanitizeDistinctSlice(sig.SystemFingerprints, redactFn)
+	} else {
+		if sig.ResponseModels != nil {
+			out.ResponseModels = append([]string(nil), sig.ResponseModels...)
+		}
+		if sig.SystemFingerprints != nil {
+			out.SystemFingerprints = append([]string(nil), sig.SystemFingerprints...)
+		}
 	}
 	if sig.HasReasoningField != nil {
 		flag := *sig.HasReasoningField
 		out.HasReasoningField = &flag
 	}
 	for pid, p := range sig.Probes {
-		cleanPID := redactExactSecrets(pid, target)
+		cleanPID := pid
+		cleanProbeID := p.ProbeID
+		if redactFn != nil {
+			cleanPID = redactFn(pid)
+			cleanProbeID = redactFn(p.ProbeID)
+		}
 		cleanSamples := make([]string, len(p.Samples))
 		for i, sample := range p.Samples {
-			cleanSamples[i] = redactExactSecrets(sample, target)
+			if redactFn != nil {
+				sample = redactFn(sample)
+			}
+			cleanSamples[i] = normalizeBehaviorText(sample)
 		}
 		out.Probes[cleanPID] = BehaviorProbeSignature{
-			ProbeID:         redactExactSecrets(p.ProbeID, target),
+			ProbeID:         cleanProbeID,
 			Samples:         cleanSamples,
 			ExpectedFormat:  p.ExpectedFormat,
 			FormatMatchRate: p.FormatMatchRate,
@@ -1811,14 +1916,17 @@ func sanitizeCapturedBehaviorSignature(sig *BehaviorSignature, target ProbeTarge
 	return out
 }
 
-func redactDistinctSlice(items []string, target ProbeTarget) []string {
+func sanitizeDistinctSlice(items []string, redactFn func(string) string) []string {
 	if items == nil {
 		return nil
 	}
 	out := make([]string, 0, len(items))
 	seen := make(map[string]struct{}, len(items))
 	for _, item := range items {
-		clean := redactExactSecrets(item, target)
+		clean := item
+		if redactFn != nil {
+			clean = redactFn(item)
+		}
 		if clean == "" {
 			continue
 		}

@@ -36,6 +36,7 @@ func TestSchemaDDLContainsAllSixTablesAndPartialUniqueIndex(t *testing.T) {
 
 	partialUniquePattern := `create\s+unique\s+index\s+if\s+not\s+exists\s+\w+\s+on\s+modelfp_baselines\s*\(\s*canonical_model\s*,\s*protocol\s*,\s*suite_id\s*,\s*detector_kind\s*\)\s+where\s+status\s*=\s*'active'`
 	require.Regexp(t, partialUniquePattern, joined, "expected partial unique active baseline index")
+	require.Contains(t, joined, "add column if not exists updated_at")
 
 	// Verify EnsureSchema executes all DDL statements cleanly and rejects nil db.
 	require.Error(t, EnsureSchema(context.Background(), nil))
@@ -69,11 +70,11 @@ func TestMarkStaleRunningJobsFailed(t *testing.T) {
 
 		store := NewPostgresStore(db)
 		mock.ExpectBegin()
-		mock.ExpectExec(`(?s)UPDATE\s+modelfp_runs\s+SET\s+status\s*=\s*'failed'.*error_message\s*=\s*\$1.*finished_at\s*=\s*NOW\(\)\s+WHERE\s+status\s+IN\s*\(\s*'queued'\s*,\s*'running'\s*\)`).
-			WithArgs("server restarted").
+		mock.ExpectExec(`(?s)UPDATE\s+modelfp_runs\s+SET\s+status\s*=\s*'failed'.*error_message\s*=\s*\$1.*finished_at\s*=\s*NOW\(\).*updated_at\s*=\s*NOW\(\)\s+WHERE\s+status\s+IN\s*\(\s*'queued'\s*,\s*'running'\s*\)\s+AND\s+updated_at\s*<\s*\$2`).
+			WithArgs("server restarted", sqlmock.AnyArg()).
 			WillReturnResult(sqlmock.NewResult(0, 2))
-		mock.ExpectExec(`(?s)UPDATE\s+modelfp_capture_jobs\s+SET\s+status\s*=\s*'failed'.*error_message\s*=\s*\$1.*finished_at\s*=\s*NOW\(\)\s+WHERE\s+status\s+IN\s*\(\s*'queued'\s*,\s*'running'\s*\)`).
-			WithArgs("server restarted").
+		mock.ExpectExec(`(?s)UPDATE\s+modelfp_capture_jobs\s+SET\s+status\s*=\s*'failed'.*error_message\s*=\s*\$1.*finished_at\s*=\s*NOW\(\).*updated_at\s*=\s*NOW\(\)\s+WHERE\s+status\s+IN\s*\(\s*'queued'\s*,\s*'running'\s*\)\s+AND\s+updated_at\s*<\s*\$2`).
+			WithArgs("server restarted", sqlmock.AnyArg()).
 			WillReturnResult(sqlmock.NewResult(0, 1))
 		mock.ExpectCommit()
 
@@ -82,8 +83,8 @@ func TestMarkStaleRunningJobsFailed(t *testing.T) {
 
 		// Blank reason defaults to "server restarted".
 		mock.ExpectBegin()
-		mock.ExpectExec(`UPDATE\s+modelfp_runs`).WithArgs("server restarted").WillReturnResult(sqlmock.NewResult(0, 0))
-		mock.ExpectExec(`UPDATE\s+modelfp_capture_jobs`).WithArgs("server restarted").WillReturnResult(sqlmock.NewResult(0, 0))
+		mock.ExpectExec(`UPDATE\s+modelfp_runs`).WithArgs("server restarted", sqlmock.AnyArg()).WillReturnResult(sqlmock.NewResult(0, 0))
+		mock.ExpectExec(`UPDATE\s+modelfp_capture_jobs`).WithArgs("server restarted", sqlmock.AnyArg()).WillReturnResult(sqlmock.NewResult(0, 0))
 		mock.ExpectCommit()
 		require.NoError(t, store.MarkStaleRunningJobsFailed(ctx, "   "))
 		require.NoError(t, mock.ExpectationsWereMet())
@@ -118,12 +119,38 @@ func TestMarkStaleRunningJobsFailed(t *testing.T) {
 		require.NoError(t, err)
 		runningJob, err := store.CreateCaptureJob(ctx, CaptureJob{Status: RunStatusRunning, Protocol: ProtocolOpenAIChat, SuiteID: suite.ID, SourceType: SourceOfficialDirect, SampleRounds: 3, TotalModels: 1})
 		require.NoError(t, err)
+		freshRun, err := store.CreateRun(ctx, Run{TargetSource: TargetSourceAdHoc, TargetLabel: "fresh-bg", Protocol: ProtocolOpenAIChat, SuiteID: suite.ID, Status: RunStatusRunning, TotalModels: 1})
+		require.NoError(t, err)
+		freshJob, err := store.CreateCaptureJob(ctx, CaptureJob{Status: RunStatusRunning, Protocol: ProtocolOpenAIChat, SuiteID: suite.ID, SourceType: SourceOfficialDirect, SampleRounds: 3, TotalModels: 1})
+		require.NoError(t, err)
 		completedJob, err := store.CreateCaptureJob(ctx, CaptureJob{Status: RunStatusCompleted, Protocol: ProtocolOpenAIChat, SuiteID: suite.ID, SourceType: SourceOfficialDirect, SampleRounds: 3, TotalModels: 1, FinishedAt: &oldFinished})
 		require.NoError(t, err)
 		cancelledJob, err := store.CreateCaptureJob(ctx, CaptureJob{Status: RunStatusCancelled, Protocol: ProtocolOpenAIChat, SuiteID: suite.ID, SourceType: SourceOfficialDirect, SampleRounds: 3, TotalModels: 1, ErrorMessage: "cancelled", FinishedAt: &oldFinished})
 		require.NoError(t, err)
 
+		staleTimestamp := time.Now().UTC().Add(-defaultStaleJobGracePeriod - time.Minute)
+		store.mu.Lock()
+		for _, id := range []int64{queuedRun.ID, runningRun.ID} {
+			r := store.runs[id]
+			r.UpdatedAt = staleTimestamp
+			store.runs[id] = r
+		}
+		for _, id := range []int64{queuedJob.ID, runningJob.ID} {
+			j := store.jobs[id]
+			j.UpdatedAt = staleTimestamp
+			store.jobs[id] = j
+		}
+		store.mu.Unlock()
+
 		require.NoError(t, store.MarkStaleRunningJobsFailed(ctx, "server restarted"))
+
+		// Active blue-green jobs updated within grace period must remain running.
+		gotFreshRun, err := store.GetRun(ctx, freshRun.ID)
+		require.NoError(t, err)
+		require.Equal(t, RunStatusRunning, gotFreshRun.Status)
+		gotFreshJob, err := store.GetCaptureJob(ctx, freshJob.ID)
+		require.NoError(t, err)
+		require.Equal(t, RunStatusRunning, gotFreshJob.Status)
 
 		for _, id := range []int64{queuedRun.ID, runningRun.ID} {
 			got, err := store.GetRun(ctx, id)
@@ -443,10 +470,10 @@ func TestPostgresStoreBaselinesFamiliesRunsAndCaptures(t *testing.T) {
 
 	// Run create + RunItem insert (preserving UsedStaleBaseline).
 	acctID := int64(7)
-	runCols := []string{"id", "target_source", "account_id", "target_label", "protocol", "suite_id", "status", "total_models", "completed_models", "summary_json", "error_message", "created_by", "started_at", "finished_at", "created_at"}
+	runCols := []string{"id", "target_source", "account_id", "target_label", "protocol", "suite_id", "status", "total_models", "completed_models", "summary_json", "error_message", "created_by", "started_at", "finished_at", "created_at", "updated_at"}
 	mock.ExpectQuery(`(?s)INSERT\s+INTO\s+modelfp_runs`).
 		WithArgs(string(TargetSourceAccount), int64(7), "account #7", string(ProtocolOpenAIChat), int64(1), string(RunStatusQueued), 2, 0, sqlmock.AnyArg(), "", int64(1), nil, nil).
-		WillReturnRows(sqlmock.NewRows(runCols).AddRow(int64(10), "account", int64(7), "account #7", "openai_chat", int64(1), "queued", 2, 0, []byte(`{}`), "", int64(1), nil, nil, now))
+		WillReturnRows(sqlmock.NewRows(runCols).AddRow(int64(10), "account", int64(7), "account #7", "openai_chat", int64(1), "queued", 2, 0, []byte(`{}`), "", int64(1), nil, nil, now, now))
 	createdRun, err := store.CreateRun(ctx, Run{
 		TargetSource: TargetSourceAccount,
 		AccountID:    &acctID,
@@ -491,9 +518,9 @@ func TestPostgresStoreBaselinesFamiliesRunsAndCaptures(t *testing.T) {
 	require.Len(t, savedItem.TopCandidates, 1)
 
 	// CaptureJob create + update.
-	jobCols := []string{"id", "status", "protocol", "suite_id", "source_type", "sample_rounds", "total_models", "completed_models", "results_json", "error_message", "created_by", "created_at", "finished_at"}
+	jobCols := []string{"id", "status", "protocol", "suite_id", "source_type", "sample_rounds", "total_models", "completed_models", "results_json", "error_message", "created_by", "created_at", "updated_at", "finished_at"}
 	mock.ExpectQuery(`(?s)INSERT\s+INTO\s+modelfp_capture_jobs`).
-		WillReturnRows(sqlmock.NewRows(jobCols).AddRow(int64(21), "queued", "openai_chat", int64(1), "official_direct", 3, 1, 0, []byte(`[]`), "", int64(1), now, nil))
+		WillReturnRows(sqlmock.NewRows(jobCols).AddRow(int64(21), "queued", "openai_chat", int64(1), "official_direct", 3, 1, 0, []byte(`[]`), "", int64(1), now, now, nil))
 	job, err := store.CreateCaptureJob(ctx, CaptureJob{
 		Status:       RunStatusQueued,
 		Protocol:     ProtocolOpenAIChat,
@@ -816,10 +843,10 @@ func TestPostgresStoreRemainingMethodsAndNilSafety(t *testing.T) {
 		FinishedAt:      &now,
 	}))
 
-	runCols := []string{"id", "target_source", "account_id", "target_label", "protocol", "suite_id", "status", "total_models", "completed_models", "summary_json", "error_message", "created_by", "started_at", "finished_at", "created_at"}
+	runCols := []string{"id", "target_source", "account_id", "target_label", "protocol", "suite_id", "status", "total_models", "completed_models", "summary_json", "error_message", "created_by", "started_at", "finished_at", "created_at", "updated_at"}
 	mock.ExpectQuery(`(?s)SELECT\s+.*FROM\s+modelfp_runs\s+WHERE\s+id\s*=\s*\$1`).
 		WithArgs(int64(10)).
-		WillReturnRows(sqlmock.NewRows(runCols).AddRow(int64(10), "adhoc", nil, "api.example.com", "openai_chat", int64(1), "completed", 2, 2, []byte(`{"match":2}`), "", int64(1), now, now, now))
+		WillReturnRows(sqlmock.NewRows(runCols).AddRow(int64(10), "adhoc", nil, "api.example.com", "openai_chat", int64(1), "completed", 2, 2, []byte(`{"match":2}`), "", int64(1), now, now, now, now))
 	gotRun, err := store.GetRun(ctx, 10)
 	require.NoError(t, err)
 	require.Equal(t, 2, gotRun.Summary.Match)
@@ -828,7 +855,7 @@ func TestPostgresStoreRemainingMethodsAndNilSafety(t *testing.T) {
 		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(int64(1)))
 	mock.ExpectQuery(`(?s)SELECT\s+.*FROM\s+modelfp_runs\s+ORDER\s+BY\s+created_at\s+DESC.*LIMIT\s+\$1\s+OFFSET\s+\$2`).
 		WithArgs(100, 0).
-		WillReturnRows(sqlmock.NewRows(runCols).AddRow(int64(10), "adhoc", nil, "api.example.com", "openai_chat", int64(1), "completed", 2, 2, []byte(`{"match":2}`), "", int64(1), now, now, now))
+		WillReturnRows(sqlmock.NewRows(runCols).AddRow(int64(10), "adhoc", nil, "api.example.com", "openai_chat", int64(1), "completed", 2, 2, []byte(`{"match":2}`), "", int64(1), now, now, now, now))
 	runPage, err := store.ListRuns(ctx, 0, 500)
 	require.NoError(t, err)
 	require.Equal(t, 1, runPage.Page)
@@ -853,14 +880,122 @@ func TestPostgresStoreRemainingMethodsAndNilSafety(t *testing.T) {
 	require.NoError(t, store.DeleteRun(ctx, 10))
 
 	// GetCaptureJob
-	jobCols := []string{"id", "status", "protocol", "suite_id", "source_type", "sample_rounds", "total_models", "completed_models", "results_json", "error_message", "created_by", "created_at", "finished_at"}
+	jobCols := []string{"id", "status", "protocol", "suite_id", "source_type", "sample_rounds", "total_models", "completed_models", "results_json", "error_message", "created_by", "created_at", "updated_at", "finished_at"}
 	mock.ExpectQuery(`(?s)SELECT\s+.*FROM\s+modelfp_capture_jobs\s+WHERE\s+id\s*=\s*\$1`).
 		WithArgs(int64(21)).
-		WillReturnRows(sqlmock.NewRows(jobCols).AddRow(int64(21), "completed", "openai_chat", int64(1), "official_direct", 3, 1, 1, []byte(`[{"model":"gpt-4o","canonical_model":"gpt-4o"}]`), "", int64(1), now, now))
+		WillReturnRows(sqlmock.NewRows(jobCols).AddRow(int64(21), "completed", "openai_chat", int64(1), "official_direct", 3, 1, 1, []byte(`[{"model":"gpt-4o","canonical_model":"gpt-4o"}]`), "", int64(1), now, now, now))
 	gotJob, err := store.GetCaptureJob(ctx, 21)
 	require.NoError(t, err)
 	require.Equal(t, RunStatusCompleted, gotJob.Status)
 	require.Len(t, gotJob.Results, 1)
 
 	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestTerminalStatusNonRegressionAndAtomicBaselineCommit(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 11, 25, 11, 0, 0, 0, time.UTC)
+
+	t.Run("postgres_sqlmock_guards_atomic_and_seed_family_map", func(t *testing.T) {
+		db, mock, err := sqlmock.New()
+		require.NoError(t, err)
+		defer func() { _ = db.Close() }()
+		store := NewPostgresStore(db)
+
+		// UpdateRunProgress terminal guard -> 0 affected rows yields ErrNotFound.
+		mock.ExpectExec(`(?s)UPDATE\s+modelfp_runs.*AND\s+status\s+NOT\s+IN\s*\(\s*'completed'\s*,\s*'cancelled'\s*,\s*'failed'\s*\)`).
+			WillReturnResult(sqlmock.NewResult(0, 0))
+		require.ErrorIs(t, store.UpdateRunProgress(ctx, Run{ID: 77, Status: RunStatusRunning}), ErrNotFound)
+
+		// UpdateCaptureJob terminal guard -> 0 affected rows yields ErrNotFound.
+		mock.ExpectExec(`(?s)UPDATE\s+modelfp_capture_jobs.*AND\s+status\s+NOT\s+IN\s*\(\s*'completed'\s*,\s*'cancelled'\s*,\s*'failed'\s*\)`).
+			WillReturnResult(sqlmock.NewResult(0, 0))
+		require.ErrorIs(t, store.UpdateCaptureJob(ctx, CaptureJob{ID: 88, Status: RunStatusRunning}), ErrNotFound)
+
+		// InsertSeedFamilyMapIfMissing uses ON CONFLICT (canonical_model) DO NOTHING.
+		mock.ExpectExec(`(?s)INSERT\s+INTO\s+modelfp_family_maps.*ON\s+CONFLICT\s*\(\s*canonical_model\s*\)\s+DO\s+NOTHING`).
+			WithArgs("gpt-4o", "gpt-4o", sqlmock.AnyArg(), sqlmock.AnyArg()).
+			WillReturnResult(sqlmock.NewResult(0, 0))
+		require.NoError(t, store.InsertSeedFamilyMapIfMissing(ctx, FamilyMap{CanonicalModel: "gpt-4o", Family: "gpt-4o"}))
+
+		// UpsertActiveBaselinesAtomic rolls back entire transaction if second write fails.
+		lpSig := &LogprobsSignature{Probes: map[string]LogprobsProbeSignature{"lp-1": {ProbeID: "lp-1", Distribution: map[string]float64{"yes": 1.0}}}}
+		bhSig := &BehaviorSignature{Probes: map[string]BehaviorProbeSignature{"bh-1": {ProbeID: "bh-1", Samples: []string{"ok"}}}}
+
+		mock.ExpectBegin()
+		mock.ExpectExec(`(?s)UPDATE\s+modelfp_baselines\s+SET\s+status\s*=\s*'archived'`).
+			WillReturnResult(sqlmock.NewResult(0, 1))
+		mock.ExpectQuery(`(?s)INSERT\s+INTO\s+modelfp_baselines`).
+			WillReturnRows(sqlmock.NewRows([]string{"id", "canonical_model", "protocol", "suite_id", "detector_kind", "source_type", "source_label", "upstream_snapshot", "sample_count", "signature_json", "self_divergence_p95", "match_threshold", "suspect_threshold", "ttl_days", "status", "notes", "collected_at", "created_at", "updated_at"}).
+				AddRow(int64(1), "gpt-4o", "openai_chat", int64(1), "logprobs", "official_direct", "src", "", 3, []byte(`{"probes":{}}`), 0.01, 0.08, 0.18, 60, "active", "", now, now, now))
+		mock.ExpectExec(`(?s)UPDATE\s+modelfp_baselines\s+SET\s+status\s*=\s*'archived'`).
+			WillReturnResult(sqlmock.NewResult(0, 1))
+		mock.ExpectQuery(`(?s)INSERT\s+INTO\s+modelfp_baselines`).
+			WillReturnError(errors.New("simulated second insert failure"))
+		mock.ExpectRollback()
+
+		_, err = store.UpsertActiveBaselinesAtomic(ctx, []Baseline{
+			{CanonicalModel: "gpt-4o", Protocol: ProtocolOpenAIChat, SuiteID: 1, DetectorKind: DetectorLogprobs, Logprobs: lpSig},
+			{CanonicalModel: "gpt-4o", Protocol: ProtocolOpenAIChat, SuiteID: 1, DetectorKind: DetectorBehavior, Behavior: bhSig},
+		})
+		require.ErrorContains(t, err, "simulated second insert failure")
+		require.NoError(t, mock.ExpectationsWereMet())
+	})
+
+	t.Run("memory_store_guards_and_rollback", func(t *testing.T) {
+		store := NewMemoryStore()
+		suite, err := store.CreateSuite(ctx, ProbeSuite{
+			SuiteKey:   "guard-suite",
+			Version:    "v1",
+			Name:       "Guard Suite",
+			Visibility: VisibilityPublic,
+			Status:     StatusActive,
+			Probes:     []ProbeDefinition{{ID: "bh-1", Kind: DetectorBehavior, Prompt: "hi", MaxTokens: 16}},
+		})
+		require.NoError(t, err)
+
+		for _, term := range []RunStatus{RunStatusCompleted, RunStatusCancelled, RunStatusFailed} {
+			r, createErr := store.CreateRun(ctx, Run{TargetSource: TargetSourceAdHoc, TargetLabel: "t", Protocol: ProtocolAnthropic, SuiteID: suite.ID, Status: term, TotalModels: 1})
+			require.NoError(t, createErr)
+			require.ErrorIs(t, store.UpdateRunProgress(ctx, Run{ID: r.ID, Status: RunStatusRunning, CompletedModels: 1}), ErrNotFound)
+			gotR, _ := store.GetRun(ctx, r.ID)
+			require.Equal(t, term, gotR.Status)
+
+			j, jobErr := store.CreateCaptureJob(ctx, CaptureJob{Status: term, Protocol: ProtocolAnthropic, SuiteID: suite.ID, SourceType: SourceOfficialDirect, TotalModels: 1})
+			require.NoError(t, jobErr)
+			require.ErrorIs(t, store.UpdateCaptureJob(ctx, CaptureJob{ID: j.ID, Status: RunStatusQueued, CompletedModels: 1}), ErrNotFound)
+			gotJ, _ := store.GetCaptureJob(ctx, j.ID)
+			require.Equal(t, term, gotJ.Status)
+		}
+
+		// Pre-existing active logprobs baseline must survive rolled-back dual commit.
+		orig, err := store.UpsertActiveBaseline(ctx, Baseline{
+			CanonicalModel: "gpt-4o",
+			Protocol:       ProtocolOpenAIChat,
+			SuiteID:        suite.ID,
+			DetectorKind:   DetectorLogprobs,
+			Notes:          "prior-active",
+			Logprobs:       &LogprobsSignature{Probes: map[string]LogprobsProbeSignature{"lp-1": {ProbeID: "lp-1", Distribution: map[string]float64{"ok": 1}}}},
+		})
+		require.NoError(t, err)
+
+		store.beforeBaselineInsert = func(b Baseline) error {
+			if b.DetectorKind == DetectorBehavior {
+				return errors.New("behavior commit boom")
+			}
+			return nil
+		}
+		_, err = store.UpsertActiveBaselinesAtomic(ctx, []Baseline{
+			{CanonicalModel: "gpt-4o", Protocol: ProtocolOpenAIChat, SuiteID: suite.ID, DetectorKind: DetectorLogprobs, Notes: "new-lp", Logprobs: orig.Logprobs},
+			{CanonicalModel: "gpt-4o", Protocol: ProtocolOpenAIChat, SuiteID: suite.ID, DetectorKind: DetectorBehavior, Behavior: &BehaviorSignature{Probes: map[string]BehaviorProbeSignature{"bh-1": {ProbeID: "bh-1", Samples: []string{"hi"}}}}},
+		})
+		require.ErrorContains(t, err, "behavior commit boom")
+		store.beforeBaselineInsert = nil
+
+		all, err := store.ListBaselines(ctx, BaselineFilter{CanonicalModel: "gpt-4o", Status: StatusActive})
+		require.NoError(t, err)
+		require.Len(t, all, 1)
+		require.Equal(t, orig.ID, all[0].ID)
+		require.Equal(t, "prior-active", all[0].Notes)
+	})
 }
