@@ -1623,3 +1623,27 @@ func TestBaselineCaptureHeadersPrivatePromptsSeedsAndLimits(t *testing.T) {
 		require.Equal(t, maxBehaviorSampleRunes, len([]rune(stored[0].Behavior.Probes["bh-1"].Samples[0])))
 	})
 }
+
+func TestModelContainsCredentialsSeparatesRoutingHeadersFromSecrets(t *testing.T) {
+	target := ProbeTarget{
+		APIKey: "sk-live-secret-12345",
+		ExtraHeaders: map[string]string{
+			"X-Provider":   "openai",
+			"X-Auth-Token": "tok-custom-98765",
+		},
+	}
+
+	if modelContainsCredentials("openai/gpt-4o", target) {
+		t.Fatalf("expected non-secret routing header X-Provider=openai not to block openai/gpt-4o")
+	}
+	if !modelContainsCredentials("bad-tok-custom-98765", target) {
+		t.Fatalf("expected auth-like header value to be blocked in model name")
+	}
+	if !modelContainsCredentials("bad-sk-live-secret-12345", target) {
+		t.Fatalf("expected APIKey to be blocked in model name")
+	}
+	// Output redaction must still scrub all custom header values including X-Provider.
+	if red := redactExactSecrets("reflected openai and tok-custom-98765", target); strings.Contains(red, "openai") || strings.Contains(red, "tok-custom-98765") {
+		t.Fatalf("expected output redaction to scrub all custom headers, got %q", red)
+	}
+}

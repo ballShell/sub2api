@@ -1360,6 +1360,24 @@ func unescapeJSONSequences(s string) string {
 }
 
 func collectSecrets(target ProbeTarget) []string {
+	return collectSecretsWithPolicy(target, true)
+}
+
+func collectModelAdmissionSecrets(target ProbeTarget) []string {
+	return collectSecretsWithPolicy(target, false)
+}
+
+func isAuthLikeHeaderName(name string) bool {
+	lower := strings.ToLower(strings.TrimSpace(name))
+	for _, kw := range []string{"auth", "key", "token", "secret", "pass", "cred", "cookie", "sig", "bearer"} {
+		if strings.Contains(lower, kw) {
+			return true
+		}
+	}
+	return false
+}
+
+func collectSecretsWithPolicy(target ProbeTarget, includeAllHeaders bool) []string {
 	seen := make(map[string]struct{})
 	var secrets []string
 	addVariant := func(s string) {
@@ -1406,8 +1424,11 @@ func collectSecrets(target ProbeTarget) []string {
 			}
 		}
 	}
-	for _, v := range target.ExtraHeaders {
-		if len(strings.TrimSpace(v)) >= 3 {
+	for k, v := range target.ExtraHeaders {
+		if len(strings.TrimSpace(v)) < 3 {
+			continue
+		}
+		if includeAllHeaders || isAuthLikeHeaderName(k) {
 			addWithEncodings(v)
 		}
 	}

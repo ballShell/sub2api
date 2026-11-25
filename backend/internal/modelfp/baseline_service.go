@@ -1784,7 +1784,7 @@ func modelContainsCredentials(model string, target ProbeTarget) bool {
 	if model == "" {
 		return false
 	}
-	if containsAnySecretOrToken(model, collectSecrets(target)) {
+	if containsAnySecretOrToken(model, collectModelAdmissionSecrets(target)) {
 		return true
 	}
 	if key := strings.TrimSpace(target.APIKey); key != "" && strings.Contains(model, key) {
