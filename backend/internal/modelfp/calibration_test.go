@@ -133,6 +133,16 @@ func TestDeriveThresholdsEdgeCases(t *testing.T) {
 	if bm2 < 0.12 || bm2 > 0.38 || bs2 <= bm2 || bs2 > 0.60 {
 		t.Fatalf("unexpected behavior calibrated bounds: match=%v suspect=%v", bm2, bs2)
 	}
+
+	// Without a nearest neighbor, return conservative engine defaults regardless of selfDivP95.
+	mDef, sDef := DeriveThresholds(DetectorLogprobs, 0.10, nil)
+	if math.Abs(mDef-0.08) > 1e-9 || math.Abs(sDef-0.18) > 1e-9 {
+		t.Fatalf("expected logprobs conservative defaults (0.08, 0.18), got (%v, %v)", mDef, sDef)
+	}
+	bmDef, bsDef := DeriveThresholds(DetectorBehavior, 0.10, nil)
+	if math.Abs(bmDef-0.18) > 1e-9 || math.Abs(bsDef-0.32) > 1e-9 {
+		t.Fatalf("expected behavior conservative defaults (0.18, 0.32), got (%v, %v)", bmDef, bsDef)
+	}
 }
 
 func TestBuildConfusionMatrix(t *testing.T) {
@@ -283,10 +293,26 @@ func TestSeedsLoadValidJSON(t *testing.T) {
 			seenAliases[alias] = fm.CanonicalModel
 		}
 	}
-	for _, required := range []string{"claude-opus-4-6", "claude-sonnet-4-6", "gpt-4o", "gpt-5", "gemini-2.5-pro", "deepseek-v3", "deepseek-r1"} {
+	for _, required := range []string{"claude-opus-4-6", "claude-sonnet-4-6", "gpt-4o", "gpt-5", "gemini-2.5-pro", "gemini-2.5-flash", "gemini-2.5-flash-lite", "deepseek-v3", "deepseek-r1"} {
 		if !hasModel[required] {
 			t.Fatalf("expected canonical model %q in default family maps", required)
 		}
+	}
+	for alias, canonical := range seenAliases {
+		if hasModel[alias] {
+			t.Fatalf("alias %q collides with canonical_model (mapped under %q)", alias, canonical)
+		}
+	}
+	peersByModel := make(map[string]map[string]bool, len(families))
+	for _, fm := range families {
+		peers := make(map[string]bool, len(fm.ConfusionPeers))
+		for _, peer := range fm.ConfusionPeers {
+			peers[peer] = true
+		}
+		peersByModel[fm.CanonicalModel] = peers
+	}
+	if !peersByModel["gemini-2.5-flash"]["gemini-2.5-flash-lite"] || !peersByModel["gemini-2.5-flash-lite"]["gemini-2.5-flash"] {
+		t.Fatalf("expected gemini-2.5-flash and gemini-2.5-flash-lite to be linked via confusion_peers")
 	}
 	if len(baselines) != 0 {
 		t.Fatalf("seed baselines must not contain fabricated distributions, got %d", len(baselines))

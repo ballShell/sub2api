@@ -328,9 +328,7 @@ func DeriveThresholds(kind DetectorKind, selfDivP95 float64, nearestDist *float6
 	epsMin, epsMax, suspectCap, defMatch, defSuspect := detectorBounds(kind)
 
 	if nearestDist == nil || math.IsNaN(*nearestDist) || math.IsInf(*nearestDist, 0) || *nearestDist < 0 {
-		match := clampFloat(math.Max(2.5*selfDivP95, defMatch), epsMin, epsMax)
-		suspect := math.Min(math.Max(2.0*match, defSuspect), suspectCap)
-		return match, suspect
+		return defMatch, defSuspect
 	}
 
 	near := *nearestDist
