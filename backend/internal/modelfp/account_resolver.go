@@ -20,10 +20,7 @@ import (
 	"golang.org/x/net/http/httpguts"
 )
 
-const (
-	defaultOpenAIBaseURL    = "https://api.openai.com"
-	defaultAnthropicBaseURL = "https://api.anthropic.com"
-)
+const defaultAnthropicBaseURL = "https://api.anthropic.com"
 
 // AccountLookup provides read-only account retrieval satisfied by service.AccountRepository.
 type AccountLookup interface {
@@ -311,7 +308,7 @@ func (r *TargetResolver) resolveProxy(
 	}
 
 	var proxy *service.Proxy
-	if preloaded != nil && (preloaded.ID == 0 || preloaded.ID == *proxyID) {
+	if preloaded != nil && preloaded.ID == *proxyID {
 		proxy = preloaded
 	} else {
 		if r.proxies == nil {
@@ -482,15 +479,18 @@ func extractAccountBaseURL(account *service.Account, proto Protocol) string {
 			}
 			return strings.TrimSpace(account.GetCredential("base_url"))
 		case ProtocolOpenAIResponses:
+			var base string
 			if account.IsAdaptiveAPIProtocol() {
-				if base := strings.TrimSpace(account.GetCNProtocolBaseURL(service.APIProtocolResponses)); base != "" {
-					return base
+				base = strings.TrimSpace(account.GetCNProtocolBaseURL(service.APIProtocolResponses))
+			}
+			if base == "" {
+				if account.IsAnthropicProtocol() {
+					base = strings.TrimSpace(account.GetOpenAIFormatBaseURL())
+				} else {
+					base = strings.TrimSpace(account.GetOpenAIBaseURL())
 				}
 			}
-			if account.IsAnthropicProtocol() {
-				return strings.TrimSpace(account.GetOpenAIFormatBaseURL())
-			}
-			return strings.TrimSpace(account.GetOpenAIBaseURL())
+			return applyProviderResponsesPath(account.Platform, base)
 		default:
 			if account.IsAnthropicProtocol() {
 				return strings.TrimSpace(account.GetOpenAIFormatBaseURL())
@@ -498,6 +498,28 @@ func extractAccountBaseURL(account *service.Account, proto Protocol) string {
 			return strings.TrimSpace(account.GetOpenAIBaseURL())
 		}
 	}
+}
+
+func applyProviderResponsesPath(platform, base string) string {
+	trimmed := strings.TrimSpace(base)
+	if trimmed == "" {
+		return ""
+	}
+	profile := service.LookupProviderProfile(strings.ToLower(strings.TrimSpace(platform)))
+	if profile == nil || profile.ResponsesPath != "/responses" {
+		return trimmed
+	}
+	parsed, err := url.Parse(trimmed)
+	if err != nil {
+		return trimmed
+	}
+	path := strings.TrimRight(parsed.Path, "/")
+	if strings.HasSuffix(path, "/responses") || hasAPIVersionSuffix(path) {
+		return trimmed
+	}
+	parsed.Path = path + "/responses"
+	parsed.RawPath = ""
+	return parsed.String()
 }
 
 func resolveAccountAuthMode(account *service.Account, proto Protocol, parsedURL *url.URL) string {
@@ -594,9 +616,9 @@ func cloneStringMap(src map[string]string) map[string]string {
 func resolveAccountDefaultModels(platform string, mapping map[string]string) []string {
 	if len(mapping) > 0 {
 		models := make([]string, 0, len(mapping))
-		for k := range mapping {
+		for k, v := range mapping {
 			trimmed := strings.TrimSpace(k)
-			if trimmed == "" || strings.Contains(trimmed, "*") {
+			if trimmed == "" || strings.Contains(trimmed, "*") || strings.TrimSpace(v) == "" {
 				continue
 			}
 			models = append(models, trimmed)

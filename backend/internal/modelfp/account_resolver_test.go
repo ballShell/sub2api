@@ -262,9 +262,9 @@ func TestResolveAccountAppliesMappingHeadersAndProxy(t *testing.T) {
 		t.Fatalf("expected passthrough gpt-4.1, got %q", got)
 	}
 
-	// DefaultModels should list non-wildcard keys cleanly.
+	// DefaultModels should list non-wildcard keys with non-empty targets cleanly.
 	joinedDefaults := strings.Join(resolved.DefaultModels, ",")
-	if !strings.Contains(joinedDefaults, "gpt-4o") || !strings.Contains(joinedDefaults, "o3-mini") || strings.Contains(joinedDefaults, "gpt-5*") {
+	if !strings.Contains(joinedDefaults, "gpt-4o") || !strings.Contains(joinedDefaults, "o3-mini") || strings.Contains(joinedDefaults, "gpt-5*") || strings.Contains(joinedDefaults, "bad-map") {
 		t.Fatalf("unexpected DefaultModels: %v", resolved.DefaultModels)
 	}
 
@@ -341,6 +341,14 @@ func TestResolveAccountInfersResponsesProtocol(t *testing.T) {
 				ID: 18, Name: "MiniMax-CC", Platform: service.PlatformMiniMax, Type: service.AccountTypeAPIKey,
 				Credentials: map[string]any{
 					"api_key": "sk-mm-123456789",
+				},
+			},
+			19: {
+				ID: 19, Name: "DeepSeek-Versioned-Responses", Platform: service.PlatformDeepseek, Type: service.AccountTypeAPIKey,
+				Credentials: map[string]any{
+					"api_key":      "sk-ds-v1-123456789",
+					"api_protocol": service.APIProtocolResponses,
+					"base_url":     "https://relay.example.com/v1",
 				},
 			},
 		},
@@ -449,8 +457,15 @@ func TestResolveAccountInfersResponsesProtocol(t *testing.T) {
 	if err != nil {
 		t.Fatalf("deepseek failed: %v", err)
 	}
-	if dsRes.Target.Protocol != ProtocolOpenAIResponses || dsRes.Target.BaseURL != service.DefaultDeepseekBaseURL {
+	if dsRes.Target.Protocol != ProtocolOpenAIResponses || dsRes.Target.BaseURL != service.DefaultDeepseekBaseURL+"/responses" {
 		t.Fatalf("unexpected deepseek target: %+v", dsRes.Target)
+	}
+	dsV1Res, err := resolver.ResolveAccount(ctx, 19, "")
+	if err != nil {
+		t.Fatalf("deepseek versioned responses failed: %v", err)
+	}
+	if dsV1Res.Target.Protocol != ProtocolOpenAIResponses || dsV1Res.Target.BaseURL != "https://relay.example.com/v1" {
+		t.Fatalf("expected versioned deepseek base URL unchanged, got %+v", dsV1Res.Target)
 	}
 	mmRes, err := resolver.ResolveAccount(ctx, 18, "")
 	if err != nil {
@@ -742,5 +757,50 @@ func TestTargetResolverEdgeCasesAndDefaultConstructor(t *testing.T) {
 	errResolver := newTestResolver(&stubAccountLookup{err: dbErr}, proxies)
 	if _, err := errResolver.ResolveAccount(ctx, 1, ""); !errors.Is(err, dbErr) {
 		t.Fatalf("expected account dbErr propagated, got %v", err)
+	}
+
+	// Unhydrated (ID == 0) or mismatched preloaded account.Proxy must fall back to ProxyLookup.
+	fallbackProxyID := int64(31)
+	mismatchedProxyID := int64(32)
+	fallbackProxies := &stubProxyLookup{
+		proxies: map[int64]*service.Proxy{
+			fallbackProxyID: {
+				ID: fallbackProxyID, Protocol: "http", Host: "198.51.100.31", Port: 8080, Status: service.StatusActive,
+			},
+			mismatchedProxyID: {
+				ID: mismatchedProxyID, Protocol: "http", Host: "198.51.100.32", Port: 8081, Status: service.StatusDisabled,
+			},
+		},
+	}
+	preloadedFallbackAccounts := &stubAccountLookup{
+		accounts: map[int64]*service.Account{
+			101: {
+				ID: 101, Name: "ZeroIDPreload", Platform: service.PlatformOpenAI, Type: service.AccountTypeAPIKey,
+				ProxyID: &fallbackProxyID,
+				Proxy: &service.Proxy{
+					ID: 0, Protocol: "http", Host: "198.51.100.99", Port: 9999, Status: service.StatusActive,
+				},
+				Credentials: map[string]any{"api_key": "sk-zero-123456789", "base_url": "https://93.184.216.34"},
+			},
+			102: {
+				ID: 102, Name: "MismatchedIDPreload", Platform: service.PlatformOpenAI, Type: service.AccountTypeAPIKey,
+				ProxyID: &mismatchedProxyID,
+				Proxy: &service.Proxy{
+					ID: 999, Protocol: "http", Host: "198.51.100.99", Port: 9999, Status: service.StatusActive,
+				},
+				Credentials: map[string]any{"api_key": "sk-mismatch-123456789", "base_url": "https://93.184.216.34"},
+			},
+		},
+	}
+	fallbackResolver := newTestResolver(preloadedFallbackAccounts, fallbackProxies)
+	zeroRes, err := fallbackResolver.ResolveAccount(ctx, 101, "")
+	if err != nil {
+		t.Fatalf("zero-id preloaded proxy fallback failed: %v", err)
+	}
+	if zeroRes.Target.ProxyURL != "http://198.51.100.31:8080" {
+		t.Fatalf("expected ProxyLookup URL http://198.51.100.31:8080, got %q", zeroRes.Target.ProxyURL)
+	}
+	if _, err := fallbackResolver.ResolveAccount(ctx, 102, ""); err == nil || infraerrors.Code(err) != 400 {
+		t.Fatalf("mismatched preloaded proxy should fall back to ProxyLookup (disabled) and return 400, got %v", err)
 	}
 }
