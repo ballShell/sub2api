@@ -284,6 +284,7 @@
           <div class="tabs inline-flex">
             <button
               type="button"
+              data-test="capture-mode-adhoc"
               class="tab py-1.5 text-xs"
               :class="{ 'tab-active': captureForm.targetSource === 'adhoc' }"
               @click="captureForm.targetSource = 'adhoc'"
@@ -292,6 +293,7 @@
             </button>
             <button
               type="button"
+              data-test="capture-mode-account"
               class="tab py-1.5 text-xs"
               :class="{ 'tab-active': captureForm.targetSource === 'account' }"
               @click="captureForm.targetSource = 'account'"
@@ -365,7 +367,12 @@
             <label class="input-label" for="cap-account">
               {{ t('admin.modelFingerprint.baselines.captureModal.accountLabel') }}
             </label>
-            <select id="cap-account" v-model="captureForm.accountId" class="input">
+            <select
+              id="cap-account"
+              v-model="captureForm.accountId"
+              data-test="capture-account-select"
+              class="input"
+            >
               <option :value="null" disabled>
                 {{ t('admin.modelFingerprint.verify.accountPlaceholder') }}
               </option>
@@ -378,7 +385,13 @@
             <label class="input-label" for="cap-acc-protocol">
               {{ t('admin.modelFingerprint.baselines.captureModal.protocol') }}
             </label>
-            <select id="cap-acc-protocol" v-model="captureForm.accountProtocol" class="input">
+            <select
+              id="cap-acc-protocol"
+              v-model="captureForm.accountProtocol"
+              data-test="capture-account-protocol"
+              class="input"
+            >
+              <option value="">{{ t('admin.modelFingerprint.verify.protocolAuto') }}</option>
               <option v-for="proto in SUPPORTED_PROTOCOLS" :key="proto" :value="proto">
                 {{ t(`admin.modelFingerprint.protocols.${proto}`) }}
               </option>
@@ -1025,7 +1038,8 @@
         </label>
 
         <div
-          v-if="exportIncludePrivate"
+          v-if="exportedBundle && exportedBundleIncludePrivate"
+          data-test="export-private-warning"
           class="rounded-xl border border-amber-200 bg-amber-50 p-3 text-xs text-amber-800 dark:border-amber-800/70 dark:bg-amber-950/30 dark:text-amber-200"
         >
           {{ t('admin.modelFingerprint.baselines.exportModal.includePrivateWarning') }}
@@ -1232,7 +1246,6 @@ import {
   formatDateTime,
   formatModelFpError,
   freshnessBadgeMeta,
-  inferAccountProtocol,
   isCloseConfusionPair,
   isEligibleFingerprintAccount,
   isTerminalRunStatus,
@@ -1280,6 +1293,7 @@ const filters = reactive<BaselineFilter>({
 
 let filterDebounceTimer: number | null = null
 let capturePollTimer: number | null = null
+let exportSeq = 0
 let isUnmounted = false
 
 const eligibleAccounts = computed(() => accounts.value.filter(isEligibleFingerprintAccount))
@@ -1292,7 +1306,7 @@ const captureJob = ref<CaptureJob | null>(null)
 const captureForm = reactive<{
   targetSource: TargetSource
   accountId: number | null
-  accountProtocol: Protocol
+  accountProtocol: Protocol | ''
   adhocProtocol: Protocol
   baseUrl: string
   apiKey: string
@@ -1309,7 +1323,7 @@ const captureForm = reactive<{
 }>({
   targetSource: 'adhoc',
   accountId: null,
-  accountProtocol: 'openai_chat',
+  accountProtocol: '',
   adhocProtocol: 'openai_chat',
   baseUrl: '',
   apiKey: '',
@@ -1336,10 +1350,8 @@ const canStartCapture = computed(() => {
 
 watch(
   () => captureForm.accountId,
-  (id) => {
-    if (!id) return
-    const acc = eligibleAccounts.value.find((a) => a.id === id)
-    if (acc) captureForm.accountProtocol = inferAccountProtocol(acc)
+  () => {
+    captureForm.accountProtocol = ''
   },
 )
 
@@ -1410,6 +1422,7 @@ const showExportModal = ref(false)
 const exportIncludePrivate = ref(false)
 const exporting = ref(false)
 const exportedBundle = ref<Bundle | null>(null)
+const exportedBundleIncludePrivate = ref(false)
 
 const showImportModal = ref(false)
 const importConflictMode = ref<ImportConflictMode>('skip')
@@ -1739,23 +1752,41 @@ async function confirmDeleteBaseline() {
   }
 }
 
+watch(exportIncludePrivate, () => {
+  exportSeq++
+  exporting.value = false
+  exportedBundle.value = null
+  exportedBundleIncludePrivate.value = false
+})
+
 // Export / Import
 function openExportModal() {
+  exportSeq++
   exportIncludePrivate.value = false
+  exporting.value = false
   exportedBundle.value = null
+  exportedBundleIncludePrivate.value = false
   showExportModal.value = true
 }
 
 async function handleExportBundle() {
   if (exporting.value) return
+  const seq = ++exportSeq
+  const includePrivate = exportIncludePrivate.value
   exporting.value = true
   try {
-    exportedBundle.value = await modelFingerprintAPI.exportBaselines(exportIncludePrivate.value)
+    const bundle = await modelFingerprintAPI.exportBaselines(includePrivate)
+    if (isUnmounted || seq !== exportSeq || !showExportModal.value) return
+    exportedBundle.value = bundle
+    exportedBundleIncludePrivate.value = Boolean(bundle.include_private)
     appStore.showSuccess(t('admin.modelFingerprint.messages.bundleExported'))
   } catch (error) {
+    if (isUnmounted || seq !== exportSeq) return
     appStore.showError(formatModelFpError(error, t, 'admin.modelFingerprint.errors.exportFailed'))
   } finally {
-    exporting.value = false
+    if (!isUnmounted && seq === exportSeq) {
+      exporting.value = false
+    }
   }
 }
 

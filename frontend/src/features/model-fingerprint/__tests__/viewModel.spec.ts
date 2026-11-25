@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest'
 import type { ConfusionMatrixResult, RunItem } from '../types'
 import {
   baselineQueryParams,
+  buildTargetPayload,
   confusionCellMeta,
   extractVerifiedModels,
   formatVerifiedWhitelist,
@@ -185,6 +186,37 @@ describe('Model Fingerprint viewModel helpers', () => {
       expect(confusionCellMeta(0, true, false).tone).toBe('diagonal')
       expect(confusionCellMeta(0.04, false, true).tone).toBe('overlap')
       expect(confusionCellMeta(0.72, false, false).tone).toBe('clear')
+    })
+
+    it('buildTargetPayload omits protocol for account auto mode and includes explicit overrides', () => {
+      const autoPayload = buildTargetPayload({
+        targetSource: 'account',
+        accountId: 12,
+        accountProtocol: '',
+        adhocProtocol: 'openai_chat',
+        baseUrl: '',
+        apiKey: '',
+        authMode: '',
+        proxyId: null,
+      })
+      expect(autoPayload).toEqual({ target_source: 'account', account_id: 12 })
+      expect('protocol' in autoPayload).toBe(false)
+
+      const overridePayload = buildTargetPayload({
+        targetSource: 'account',
+        accountId: 12,
+        accountProtocol: 'openai_responses',
+        adhocProtocol: 'openai_chat',
+        baseUrl: '',
+        apiKey: '',
+        authMode: '',
+        proxyId: null,
+      })
+      expect(overridePayload).toEqual({
+        target_source: 'account',
+        account_id: 12,
+        protocol: 'openai_responses',
+      })
     })
   })
 })

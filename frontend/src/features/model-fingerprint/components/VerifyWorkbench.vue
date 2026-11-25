@@ -200,6 +200,7 @@
               :aria-label="t('admin.modelFingerprint.verify.protocolLabel')"
               class="input"
             >
+              <option value="">{{ t('admin.modelFingerprint.verify.protocolAuto') }}</option>
               <option v-for="proto in SUPPORTED_PROTOCOLS" :key="proto" :value="proto">
                 {{ t(`admin.modelFingerprint.protocols.${proto}`) }}
               </option>
@@ -618,7 +619,6 @@ import {
   extractVerifiedModels,
   formatModelFpError,
   formatVerifiedWhitelist,
-  inferAccountProtocol,
   isEligibleFingerprintAccount,
   isTerminalRunStatus,
   parseExtraHeadersJson,
@@ -654,7 +654,7 @@ const loadingMeta = ref(false)
 
 const targetSource = ref<TargetSource>('adhoc')
 const selectedAccountId = ref<number | null>(null)
-const accountProtocol = ref<Protocol>('openai_chat')
+const accountProtocol = ref<Protocol | ''>('')
 
 const adhocProtocol = ref<Protocol>('openai_chat')
 const baseUrl = ref('')
@@ -680,6 +680,8 @@ const includeUnverified = ref(false)
 
 let pollTimer: number | null = null
 let isUnmounted = false
+let discoverSeq = 0
+let cancelSeq = 0
 
 const eligibleAccounts = computed(() => accounts.value.filter(isEligibleFingerprintAccount))
 const activeSuites = computed(() => suites.value.filter((s) => s.status === 'active'))
@@ -778,12 +780,14 @@ const whitelistPreview = computed(() => {
   )
 })
 
-watch(selectedAccountId, (id) => {
-  if (!id) return
-  const matched = eligibleAccounts.value.find((acc) => acc.id === id)
-  if (matched) {
-    accountProtocol.value = inferAccountProtocol(matched)
-  }
+watch([targetSource, selectedAccountId], () => {
+  discoverSeq++
+  discovering.value = false
+  defaultModels.value = []
+})
+
+watch(selectedAccountId, () => {
+  accountProtocol.value = ''
 })
 
 watch(
@@ -835,7 +839,7 @@ async function pollRunStatus(runId: number) {
       scheduleNextPoll(runId)
     }
   } catch (error) {
-    if (isUnmounted) return
+    if (isUnmounted || activeRun.value?.id !== runId) return
     stopPolling()
     appStore.showError(formatModelFpError(error, t, 'admin.modelFingerprint.errors.loadRunFailed'))
   }
@@ -885,9 +889,11 @@ async function loadMetadata() {
 
 async function handleDiscoverModels() {
   if (!canDiscover.value) return
+  const seq = ++discoverSeq
   discovering.value = true
   try {
     const res = await modelFingerprintAPI.discoverModels(buildCurrentTarget())
+    if (isUnmounted || seq !== discoverSeq) return
     defaultModels.value = res.default_models ?? []
     if (res.models?.length) {
       modelsRaw.value = res.models.join('\n')
@@ -898,9 +904,12 @@ async function handleDiscoverModels() {
       t('admin.modelFingerprint.verify.discoverSuccess', { count: res.models?.length ?? 0 }),
     )
   } catch (error) {
+    if (isUnmounted || seq !== discoverSeq) return
     appStore.showError(formatModelFpError(error, t, 'admin.modelFingerprint.errors.discoverFailed'))
   } finally {
-    discovering.value = false
+    if (!isUnmounted && seq === discoverSeq) {
+      discovering.value = false
+    }
   }
 }
 
@@ -923,6 +932,9 @@ async function handleStartVerify() {
       models: parsedModels.value,
       concurrency: clampedConcurrency,
     })
+    if (isUnmounted) return
+    cancelSeq++
+    cancelling.value = false
     activeRun.value = run
     verdictFilter.value = 'all'
     appStore.showSuccess(t('admin.modelFingerprint.messages.runCreated'))
@@ -932,28 +944,38 @@ async function handleStartVerify() {
       scheduleNextPoll(run.id)
     }
   } catch (error) {
+    if (isUnmounted) return
     appStore.showError(formatModelFpError(error, t, 'admin.modelFingerprint.errors.createRunFailed'))
   } finally {
-    starting.value = false
+    if (!isUnmounted) {
+      starting.value = false
+    }
   }
 }
 
 async function handleCancelRun() {
-  if (!activeRun.value || cancelling.value) return
+  const runId = activeRun.value?.id
+  if (!runId || cancelling.value) return
+  const seq = ++cancelSeq
   cancelling.value = true
   try {
-    await modelFingerprintAPI.cancelRun(activeRun.value.id)
+    await modelFingerprintAPI.cancelRun(runId)
+    if (isUnmounted || activeRun.value?.id !== runId) return
     appStore.showSuccess(t('admin.modelFingerprint.messages.runCancelled'))
-    const latest = await modelFingerprintAPI.getRun(activeRun.value.id)
+    const latest = await modelFingerprintAPI.getRun(runId)
+    if (isUnmounted || activeRun.value?.id !== runId) return
     activeRun.value = latest
     if (isTerminalRunStatus(latest.status)) {
       stopPolling()
       emit('run-completed', latest)
     }
   } catch (error) {
+    if (isUnmounted || activeRun.value?.id !== runId) return
     appStore.showError(formatModelFpError(error, t, 'admin.modelFingerprint.errors.cancelRunFailed'))
   } finally {
-    cancelling.value = false
+    if (!isUnmounted && seq === cancelSeq) {
+      cancelling.value = false
+    }
   }
 }
 

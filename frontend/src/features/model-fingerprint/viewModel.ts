@@ -401,7 +401,7 @@ export function formatDateTime(value?: string | null, locale = 'en'): string {
 export interface TargetFormFields {
   targetSource: TargetSource
   accountId: number | null
-  accountProtocol: Protocol
+  accountProtocol: Protocol | ''
   adhocProtocol: Protocol
   baseUrl: string
   apiKey: string
@@ -412,18 +412,20 @@ export interface TargetFormFields {
 
 /**
  * Builds the shared target payload fields expected by discoverModels, createRun, and startCapture.
+ * For account targets, `protocol` is omitted unless an explicit override is selected so the backend
+ * uses the account's default wire protocol (e.g. openai_responses_enabled).
  */
 export function buildTargetPayload(fields: TargetFormFields): {
   target_source: TargetSource
   account_id?: number
-  protocol: Protocol
+  protocol?: Protocol
   adhoc?: AdHocTargetInput
 } {
   if (fields.targetSource === 'account') {
     return {
       target_source: 'account',
       account_id: fields.accountId ?? undefined,
-      protocol: fields.accountProtocol,
+      ...(fields.accountProtocol ? { protocol: fields.accountProtocol } : {}),
     }
   }
   const adhoc: AdHocTargetInput = {

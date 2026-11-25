@@ -335,24 +335,27 @@ describe('VerifyWorkbench', () => {
 
     await wrapper.get('[data-test="target-mode-account"]').trigger('click')
     await wrapper.get('[data-test="account-select"]').setValue('101')
+    expect((wrapper.get('[data-test="account-protocol"]').element as HTMLSelectElement).value).toBe('')
     await wrapper.get('[data-test="discover-models-btn"]').trigger('click')
     await flushPromises()
 
-    expect(mocks.discoverModels).toHaveBeenCalledWith(
-      expect.objectContaining({ target_source: 'account', account_id: 101 }),
-    )
+    const discoverArg = mocks.discoverModels.mock.calls[0][0]
+    expect(discoverArg).toEqual({ target_source: 'account', account_id: 101 })
+    expect('protocol' in discoverArg).toBe(false)
     expect((wrapper.get('[data-test="models-input"]').element as HTMLTextAreaElement).value).toContain('gpt-4o')
 
     await wrapper.get('[data-test="start-verify-btn"]').trigger('click')
     await flushPromises()
 
-    expect(mocks.createRun).toHaveBeenCalledWith(
+    const createArg = mocks.createRun.mock.calls[0][0]
+    expect(createArg).toEqual(
       expect.objectContaining({
         target_source: 'account',
         account_id: 101,
         models: ['gpt-4o', 'claude-opus-4-6', 'custom-preview-x'],
       }),
     )
+    expect('protocol' in createArg).toBe(false)
     expect(mocks.getRun).not.toHaveBeenCalled()
 
     // First 2s poll returns running
@@ -469,5 +472,91 @@ describe('VerifyWorkbench', () => {
       'gpt-4o': 'gpt-4o',
       'custom-preview-x': 'custom-preview-x',
     })
+  })
+
+  it('supports explicit account protocol override, resets on account change, and drops stale discover/cancel responses', async () => {
+    const wrapper = mountWorkbench()
+    await flushPromises()
+
+    await wrapper.get('[data-test="target-mode-account"]').trigger('click')
+    await wrapper.get('[data-test="account-select"]').setValue('101')
+    await wrapper.get('[data-test="discover-models-btn"]').trigger('click')
+    await flushPromises()
+    expect(wrapper.find('[data-test="use-default-models-btn"]').exists()).toBe(true)
+
+    // Explicit protocol override sends protocol; switching account clears defaultModels and resets to Auto ("")
+    await wrapper.get('[data-test="account-protocol"]').setValue('openai_responses')
+    await wrapper.get('[data-test="discover-models-btn"]').trigger('click')
+    await flushPromises()
+    expect(mocks.discoverModels).toHaveBeenLastCalledWith({
+      target_source: 'account',
+      account_id: 101,
+      protocol: 'openai_responses',
+    })
+
+    let resolveSlowDiscover: ((val: unknown) => void) | undefined
+    mocks.discoverModels.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          resolveSlowDiscover = resolve
+        }),
+    )
+    await wrapper.get('[data-test="discover-models-btn"]').trigger('click')
+
+    // Switch account while discoverModels is still in-flight
+    await wrapper.get('[data-test="account-select"]').setValue('102')
+    await flushPromises()
+    expect((wrapper.get('[data-test="account-protocol"]').element as HTMLSelectElement).value).toBe('')
+    expect(wrapper.find('[data-test="use-default-models-btn"]').exists()).toBe(false)
+
+    resolveSlowDiscover?.({
+      target_source: 'account',
+      account_id: 101,
+      target_label: 'stale',
+      protocol: 'openai_chat',
+      models: ['stale-model'],
+      default_models: ['stale-default'],
+    })
+    await flushPromises()
+    expect(wrapper.find('[data-test="use-default-models-btn"]').exists()).toBe(false)
+    expect((wrapper.get('[data-test="models-input"]').element as HTMLTextAreaElement).value).not.toContain(
+      'stale-model',
+    )
+
+    // Switching to adhoc also clears defaultModels
+    await wrapper.get('[data-test="discover-models-btn"]').trigger('click')
+    await flushPromises()
+    expect(wrapper.find('[data-test="use-default-models-btn"]').exists()).toBe(true)
+    await wrapper.get('[data-test="target-mode-adhoc"]').trigger('click')
+    expect(wrapper.find('[data-test="use-default-models-btn"]').exists()).toBe(false)
+
+    // Stale cancelRun response must not overwrite a newer active run
+    const run42 = { ...makeRun('running', []), id: 42 }
+    const run43 = { ...makeRun('running', []), id: 43, target_label: 'newer-run-43' }
+    mocks.createRun.mockResolvedValueOnce(run42).mockResolvedValueOnce(run43)
+
+    let resolveCancel42: ((val: unknown) => void) | undefined
+    mocks.cancelRun.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          resolveCancel42 = resolve
+        }),
+    )
+
+    await wrapper.get('[data-test="adhoc-base-url"]').setValue('https://api.example.com/v1')
+    await wrapper.get('[data-test="adhoc-api-key"]').setValue('sk-test-secret')
+    await wrapper.get('[data-test="models-input"]').setValue('gpt-4o')
+    await wrapper.get('[data-test="start-verify-btn"]').trigger('click')
+    await flushPromises()
+
+    await wrapper.get('[data-test="cancel-run-btn"]').trigger('click')
+    await wrapper.get('[data-test="start-verify-btn"]').trigger('click')
+    await flushPromises()
+    expect(wrapper.get('[data-test="run-progress"]').text()).toContain('newer-run-43')
+
+    resolveCancel42?.({ cancelled: true })
+    await flushPromises()
+    expect(mocks.getRun).not.toHaveBeenCalledWith(42)
+    expect(wrapper.get('[data-test="run-progress"]').text()).toContain('newer-run-43')
   })
 })

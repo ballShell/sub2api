@@ -415,4 +415,82 @@ describe('Model Fingerprint Workbench & Integration Surface', () => {
     )
     expect(formatModelFpError({ reason: 'UNKNOWN_CODE' }, t, 'fallback')).toBe('fallback')
   })
+
+  it('BaselineManager uses Auto protocol in account capture and binds export warning strictly to returned bundle', async () => {
+    mocks.listAccounts.mockResolvedValue({
+      items: [{ id: 101, name: 'OpenAI Key', type: 'apikey', platform: 'openai', status: 'active', parent_account_id: null }],
+      total: 1,
+      page: 1,
+      page_size: 500,
+      pages: 1,
+    })
+    mocks.startCapture.mockResolvedValue({
+      id: 91,
+      status: 'completed',
+      protocol: 'openai_responses',
+      suite_id: 1,
+      source_type: 'official_direct',
+      sample_rounds: 3,
+      total_models: 1,
+      completed_models: 1,
+      results: [],
+      created_at: '2026-11-25T00:00:00Z',
+    })
+    const privBundle: Bundle = {
+      schema_version: 'v1',
+      exported_at: '2026-11-25T00:00:00Z',
+      include_private: true,
+      suites: [sampleSuite],
+      family_maps: [sampleFamily],
+      baselines: [],
+      sha256: 'b'.repeat(64),
+    }
+    mocks.exportBaselines.mockResolvedValue(privBundle)
+
+    const wrapper = mount(BaselineManager, {
+      global: {
+        stubs: {
+          BaseDialog: BaseDialogStub,
+          ConfirmDialog: ConfirmDialogStub,
+          Icon: IconStub,
+        },
+      },
+    })
+    await flushPromises()
+
+    // Account capture defaults protocol to "" (Auto) and omits protocol from request unless overridden
+    await wrapper.get('[data-test="open-capture-btn"]').trigger('click')
+    await wrapper.get('[data-test="capture-mode-account"]').trigger('click')
+    await wrapper.get('[data-test="capture-account-select"]').setValue('101')
+    expect(
+      (wrapper.get('[data-test="capture-account-protocol"]').element as HTMLSelectElement).value,
+    ).toBe('')
+    await wrapper.get('#cap-models').setValue('gpt-4o')
+    await wrapper.get('[data-test="start-capture-btn"]').trigger('click')
+    await flushPromises()
+
+    const capArg = mocks.startCapture.mock.calls[0][0]
+    expect(capArg).toEqual(expect.objectContaining({ target_source: 'account', account_id: 101 }))
+    expect('protocol' in capArg).toBe(false)
+
+    // Close capture modal and open export modal
+    await wrapper.findAll('button').find((b) => b.text().includes('closeButton'))?.trigger('click')
+    await wrapper.get('[data-test="open-export-btn"]').trigger('click')
+    const includeCheckbox = wrapper.get<HTMLInputElement>('[data-test="export-include-private"]')
+    await includeCheckbox.setValue(true)
+    // Before exporting, private warning banner is NOT shown
+    expect(wrapper.find('[data-test="export-private-warning"]').exists()).toBe(false)
+
+    await wrapper.get('[data-test="run-export-btn"]').trigger('click')
+    await flushPromises()
+    expect(mocks.exportBaselines).toHaveBeenCalledWith(true)
+    expect(wrapper.find('[data-test="export-private-warning"]').exists()).toBe(true)
+    expect(wrapper.text()).toContain('b'.repeat(64))
+
+    // Unchecking includePrivate clears exportedBundle and hides warning
+    await includeCheckbox.setValue(false)
+    await flushPromises()
+    expect(wrapper.find('[data-test="export-private-warning"]').exists()).toBe(false)
+    expect(wrapper.text()).not.toContain('b'.repeat(64))
+  })
 })
