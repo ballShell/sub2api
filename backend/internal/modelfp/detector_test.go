@@ -1281,11 +1281,11 @@ func TestOrchestratorErrorShapedUnsupportedLogprobsFallback(t *testing.T) {
 		}
 	})
 
-	t.Run("HTTP 422 on logprobs falls back to behavior", func(t *testing.T) {
+	t.Run("HTTP 422 unsupported top_logprobs falls back to behavior", func(t *testing.T) {
 		client := &mockProbeClient{
 			handler: func(_ context.Context, _ ProbeTarget, _ string, probe ProbeDefinition, _ bool, _ int) ProbeCallResult {
 				if probe.Kind == DetectorLogprobs {
-					return ProbeCallResult{HTTPStatus: 422, ErrorCode: errorCodeUpstreamError, ErrorMessage: "unprocessable entity"}
+					return ProbeCallResult{HTTPStatus: 422, ErrorCode: errorCodeUpstreamError, ErrorMessage: "top_logprobs is not supported"}
 				}
 				if probe.ID == "bh-1" {
 					return ProbeCallResult{Text: `{"sum":55}`, HTTPStatus: 200}
@@ -1302,7 +1302,90 @@ func TestOrchestratorErrorShapedUnsupportedLogprobsFallback(t *testing.T) {
 		})
 
 		if out.Verdict != VerdictMatch || out.DetectorUsed != DetectorBehavior {
-			t.Fatalf("expected DetectorBehavior VerdictMatch on HTTP 422 logprobs error, got verdict=%s detector=%s", out.Verdict, out.DetectorUsed)
+			t.Fatalf("expected DetectorBehavior VerdictMatch on HTTP 422 unsupported top_logprobs error, got verdict=%s detector=%s", out.Verdict, out.DetectorUsed)
+		}
+	})
+
+	t.Run("HTTP 501 unknown seed parameter falls back to behavior", func(t *testing.T) {
+		client := &mockProbeClient{
+			handler: func(_ context.Context, _ ProbeTarget, _ string, probe ProbeDefinition, _ bool, _ int) ProbeCallResult {
+				if probe.Kind == DetectorLogprobs {
+					return ProbeCallResult{HTTPStatus: 501, ErrorCode: errorCodeUpstreamError, ErrorMessage: "unknown parameter: 'seed'"}
+				}
+				if probe.ID == "bh-1" {
+					return ProbeCallResult{Text: `{"sum":55}`, HTTPStatus: 200}
+				}
+				return ProbeCallResult{Text: "7", HTTPStatus: 200}
+			},
+		}
+
+		out := NewOrchestrator(client).VerifyModel(context.Background(), VerifyModelInput{
+			Target:       target,
+			ClaimedModel: "gpt-4o",
+			Suite:        suite,
+			Baselines:    baselines,
+		})
+
+		if out.Verdict != VerdictMatch || out.DetectorUsed != DetectorBehavior {
+			t.Fatalf("expected DetectorBehavior VerdictMatch on HTTP 501 unknown seed parameter, got verdict=%s detector=%s", out.Verdict, out.DetectorUsed)
+		}
+	})
+
+	t.Run("error code logprobs_unsupported falls back to behavior", func(t *testing.T) {
+		client := &mockProbeClient{
+			handler: func(_ context.Context, _ ProbeTarget, _ string, probe ProbeDefinition, _ bool, _ int) ProbeCallResult {
+				if probe.Kind == DetectorLogprobs {
+					return ProbeCallResult{HTTPStatus: 400, ErrorCode: "logprobs_unsupported", ErrorMessage: "feature disabled"}
+				}
+				if probe.ID == "bh-1" {
+					return ProbeCallResult{Text: `{"sum":55}`, HTTPStatus: 200}
+				}
+				return ProbeCallResult{Text: "7", HTTPStatus: 200}
+			},
+		}
+
+		out := NewOrchestrator(client).VerifyModel(context.Background(), VerifyModelInput{
+			Target:       target,
+			ClaimedModel: "gpt-4o",
+			Suite:        suite,
+			Baselines:    baselines,
+		})
+
+		if out.Verdict != VerdictMatch || out.DetectorUsed != DetectorBehavior {
+			t.Fatalf("expected DetectorBehavior VerdictMatch on logprobs_unsupported error code, got verdict=%s detector=%s", out.Verdict, out.DetectorUsed)
+		}
+	})
+
+	t.Run("generic HTTP 400 and 422 upstream errors terminate with VerdictError", func(t *testing.T) {
+		for _, tc := range []struct {
+			name   string
+			status int
+			msg    string
+		}{
+			{name: "generic 400 invalid request body", status: 400, msg: "invalid request body"},
+			{name: "generic 422 billing inactive", status: 422, msg: "billing account inactive"},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				client := &mockProbeClient{
+					handler: func(_ context.Context, _ ProbeTarget, _ string, probe ProbeDefinition, _ bool, _ int) ProbeCallResult {
+						if probe.Kind == DetectorBehavior {
+							t.Fatalf("must not fall back to behavior on %s", tc.name)
+						}
+						return ProbeCallResult{HTTPStatus: tc.status, ErrorCode: errorCodeUpstreamError, ErrorMessage: tc.msg}
+					},
+				}
+
+				out := NewOrchestrator(client).VerifyModel(context.Background(), VerifyModelInput{
+					Target:       target,
+					ClaimedModel: "gpt-4o",
+					Suite:        suite,
+					Baselines:    baselines,
+				})
+
+				if out.Verdict != VerdictError || out.ErrorCode != errorCodeUpstreamError {
+					t.Fatalf("expected VerdictError upstream_error for %s, got verdict=%s code=%s", tc.name, out.Verdict, out.ErrorCode)
+				}
+			})
 		}
 	})
 

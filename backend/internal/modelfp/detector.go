@@ -910,26 +910,66 @@ func isLogprobsUnsupportedError(res ProbeCallResult) bool {
 	case errorCodeRateLimited, errorCodeTimeout, errorCodeContextCanceled:
 		return false
 	}
-	switch res.HTTPStatus {
-	case http.StatusBadRequest, http.StatusUnprocessableEntity, http.StatusNotImplemented:
+	if strings.EqualFold(strings.TrimSpace(res.ErrorCode), "logprobs_unsupported") {
 		return true
 	}
+	switch res.HTTPStatus {
+	case 0, http.StatusBadRequest, http.StatusUnprocessableEntity, http.StatusNotImplemented:
+	default:
+		return false
+	}
+
 	lowerMsg := strings.ToLower(res.ErrorMessage)
 	for _, token := range []string{
 		"logprob",
 		"top_logprobs",
 		"responselogprobs",
-		"unsupported",
-		"not support",
-		"unknown parameter",
-		"unrecognized",
-		"invalid parameter",
+		"response_logprobs",
 	} {
 		if strings.Contains(lowerMsg, token) {
 			return true
 		}
 	}
+
+	if hasSeedParameterToken(lowerMsg) {
+		for _, hint := range []string{
+			"unsupported",
+			"not support",
+			"unknown parameter",
+			"unrecognized",
+			"invalid parameter",
+			"not allowed",
+			"disallowed",
+			"unexpected",
+		} {
+			if strings.Contains(lowerMsg, hint) {
+				return true
+			}
+		}
+	}
 	return false
+}
+
+func hasSeedParameterToken(lowerMsg string) bool {
+	idx := 0
+	for {
+		pos := strings.Index(lowerMsg[idx:], "seed")
+		if pos < 0 {
+			return false
+		}
+		start := idx + pos
+		end := start + len("seed")
+		prevOK := start == 0 || !isASCIIAlphaNum(lowerMsg[start-1])
+		nextOK := end == len(lowerMsg) || !isASCIIAlphaNum(lowerMsg[end])
+		if prevOK && nextOK {
+			return true
+		}
+		idx = end
+	}
+}
+
+func isASCIIAlphaNum(b byte) bool {
+	return (b >= 'a' && b <= 'z') || (b >= '0' && b <= '9')
 }
 
 func classifyContextError(err error) *ProbeError {
