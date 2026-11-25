@@ -41,9 +41,8 @@ const (
 )
 
 var (
-	bearerTokenPattern   = regexp.MustCompile(`(?i)\bBearer\s+([^\s"',;]+)`)
-	apiKeyTokenPattern   = regexp.MustCompile(`\b(?:sk-[A-Za-z0-9_-]{8,}|AIza[0-9A-Za-z_-]{16,})`)
-	jsonUnicodeEscapesRe = regexp.MustCompile(`\\u[0-9a-fA-F]{4}`)
+	bearerTokenPattern = regexp.MustCompile(`(?i)\bBearer\s+([^\s"',;]+)`)
+	apiKeyTokenPattern = regexp.MustCompile(`\b(?:sk-[A-Za-z0-9_-]{8,}|AIza[0-9A-Za-z_-]{16,})`)
 )
 
 var blockedExtraHeaders = map[string]struct{}{
@@ -321,6 +320,13 @@ func (c *HTTPProbeClient) ExecuteProbe(
 			ErrorMessage: formatTransportError(reqErr),
 		})
 	}
+	if exceeded {
+		return finish(ProbeCallResult{
+			HTTPStatus:   status,
+			ErrorCode:    errorCodeUpstreamError,
+			ErrorMessage: "response body exceeds 256 KiB limit",
+		})
+	}
 
 	// Retry once on HTTP 400 after stripping logprobs/top_logprobs/seed/responseLogprobs.
 	retriedWithoutLogprobs := false
@@ -342,6 +348,13 @@ func (c *HTTPProbeClient) ExecuteProbe(
 				ErrorMessage: formatTransportError(reqErr),
 			})
 		}
+		if exceeded {
+			return finish(ProbeCallResult{
+				HTTPStatus:   status,
+				ErrorCode:    errorCodeUpstreamError,
+				ErrorMessage: "response body exceeds 256 KiB limit",
+			})
+		}
 	}
 
 	if status < http.StatusOK || status >= http.StatusMultipleChoices {
@@ -349,14 +362,6 @@ func (c *HTTPProbeClient) ExecuteProbe(
 			HTTPStatus:   status,
 			ErrorCode:    classifyHTTPStatus(status),
 			ErrorMessage: extractErrorMessage(status, body),
-		})
-	}
-
-	if exceeded {
-		return finish(ProbeCallResult{
-			HTTPStatus:   status,
-			ErrorCode:    errorCodeUpstreamError,
-			ErrorMessage: "response body exceeds 256 KiB limit",
 		})
 	}
 
@@ -406,12 +411,12 @@ func (c *HTTPProbeClient) DiscoverModels(ctx context.Context, target ProbeTarget
 		if reqErr != nil {
 			return nil, redactError(reqErr, target)
 		}
+		if exceeded {
+			return nil, errors.New("response body exceeds 256 KiB limit")
+		}
 		if status < http.StatusOK || status >= http.StatusMultipleChoices {
 			msg := redactSecretsWithStatus(extractErrorMessage(status, body), status, target)
 			return nil, fmt.Errorf("%s: %s", classifyHTTPStatus(status), msg)
-		}
-		if exceeded {
-			return nil, errors.New("response body exceeds 256 KiB limit")
 		}
 
 		pageModels, cursorParam, cursorVal, parseErr := parseDiscoverModelsPage(target.Protocol, body)
@@ -1252,8 +1257,8 @@ func redactSecretsWithStatus(msg string, status int, target ProbeTarget) string 
 	})
 	out = apiKeyTokenPattern.ReplaceAllString(out, redactedSecretPlaceholder)
 
-	if jsonUnicodeEscapesRe.MatchString(out) || strings.ContainsRune(out, '\\') {
-		unescaped := decodeJSONStringForInspection(out)
+	if strings.ContainsRune(out, '\\') {
+		unescaped := unescapeJSONSequences(out)
 		if containsAnySecretOrToken(unescaped, secrets) {
 			return genericHTTPFallback(status)
 		}
@@ -1285,38 +1290,54 @@ func containsAnySecretOrToken(s string, secrets []string) bool {
 	return false
 }
 
-func decodeJSONStringForInspection(s string) string {
-	var candidates []string
-	var unquoted string
-	if err := json.Unmarshal([]byte(`"`+strings.ReplaceAll(s, `"`, `\"`)+`"`), &unquoted); err == nil {
-		candidates = append(candidates, unquoted)
-	}
-	if jsonUnicodeEscapesRe.MatchString(s) {
-		candidates = append(candidates, decodeJSONUnicodeEscapes(s))
-	}
-	if len(candidates) == 0 {
-		return s
-	}
-	return strings.Join(candidates, "\n")
-}
-
-func decodeJSONUnicodeEscapes(s string) string {
+// unescapeJSONSequences decodes JSON escape sequences (including \", \\, \/, \b, \f, \n, \r, \t,
+// and \uXXXX / UTF-16 surrogate pairs) in a single pass across multiline strings.
+func unescapeJSONSequences(s string) string {
 	var sb strings.Builder
 	sb.Grow(len(s))
 	for i := 0; i < len(s); {
-		if i+6 <= len(s) && s[i] == '\\' && s[i+1] == 'u' {
-			if r1, err := strconv.ParseUint(s[i+2:i+6], 16, 32); err == nil {
-				u1 := rune(r1)
-				if utf16.IsSurrogate(u1) && i+12 <= len(s) && s[i+6] == '\\' && s[i+7] == 'u' {
-					if r2, err2 := strconv.ParseUint(s[i+8:i+12], 16, 32); err2 == nil {
-						sb.WriteRune(utf16.DecodeRune(u1, rune(r2)))
-						i += 12
+		if s[i] == '\\' && i+1 < len(s) {
+			switch s[i+1] {
+			case '"', '\\', '/':
+				sb.WriteByte(s[i+1])
+				i += 2
+				continue
+			case 'b':
+				sb.WriteByte('\b')
+				i += 2
+				continue
+			case 'f':
+				sb.WriteByte('\f')
+				i += 2
+				continue
+			case 'n':
+				sb.WriteByte('\n')
+				i += 2
+				continue
+			case 'r':
+				sb.WriteByte('\r')
+				i += 2
+				continue
+			case 't':
+				sb.WriteByte('\t')
+				i += 2
+				continue
+			case 'u':
+				if i+6 <= len(s) {
+					if r1, err := strconv.ParseUint(s[i+2:i+6], 16, 32); err == nil {
+						u1 := rune(r1)
+						if utf16.IsSurrogate(u1) && i+12 <= len(s) && s[i+6] == '\\' && s[i+7] == 'u' {
+							if r2, err2 := strconv.ParseUint(s[i+8:i+12], 16, 32); err2 == nil {
+								sb.WriteRune(utf16.DecodeRune(u1, rune(r2)))
+								i += 12
+								continue
+							}
+						}
+						sb.WriteRune(u1)
+						i += 6
 						continue
 					}
 				}
-				sb.WriteRune(u1)
-				i += 6
-				continue
 			}
 		}
 		sb.WriteByte(s[i])

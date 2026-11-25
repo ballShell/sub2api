@@ -480,6 +480,14 @@ func TestTransportErrorRedactsAPIKey(t *testing.T) {
 		t.Fatalf("expected direct redactSecrets to strip \\u0073k- secret, got %q", directRedacted)
 	}
 
+	// Multiline error containing a secret using mixed \uXXXX and \/ JSON escapes.
+	multilineSecret := "sk-multi/secret/999"
+	multilineMixed := "line one\nline two: \\u0073k-multi\\/secret\\/999\nline three"
+	multiRedacted := redactSecretsWithStatus(multilineMixed, http.StatusUnauthorized, ProbeTarget{APIKey: multilineSecret})
+	if strings.Contains(multiRedacted, "multi") || strings.Contains(multiRedacted, "999") || !strings.Contains(multiRedacted, "upstream HTTP 401") {
+		t.Fatalf("expected multiline mixed-escape secret replaced with generic HTTP 401 fallback, got %q", multiRedacted)
+	}
+
 	// Also check DiscoverModels redaction and HTTP error taxonomy
 	statusCases := []struct {
 		status int
@@ -938,6 +946,25 @@ func TestResponseBody256KBLimit(t *testing.T) {
 		Protocol: ProtocolOpenAIChat, BaseURL: srv.URL, APIKey: "sk-body-secret",
 	}); err == nil {
 		t.Fatalf("expected oversized DiscoverModels response to return error")
+	}
+
+	// Oversized HTTP 400 response must be rejected immediately without triggering logprobs retry.
+	var oversized400Calls atomic.Int32
+	oversized400Srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		oversized400Calls.Add(1)
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(`{"error":{"message":"sk-body-secret ` + oversized + `"}}`))
+	}))
+	defer oversized400Srv.Close()
+
+	res400 := client.ExecuteProbe(context.Background(), ProbeTarget{
+		Protocol: ProtocolOpenAIChat, BaseURL: oversized400Srv.URL, APIKey: "sk-body-secret",
+	}, "gpt-4o", ProbeDefinition{ID: "lp1", Kind: DetectorLogprobs, Prompt: "hi", MaxTokens: 1}, true)
+	if oversized400Calls.Load() != 1 {
+		t.Fatalf("expected oversized 400 response not to retry, got %d calls", oversized400Calls.Load())
+	}
+	if res400.ErrorCode != "upstream_error" || !strings.Contains(res400.ErrorMessage, "256 KiB") || strings.Contains(res400.ErrorMessage, "sk-body-secret") {
+		t.Fatalf("expected immediate 256 KiB limit error without secret leak, got %+v", res400)
 	}
 }
 
