@@ -208,6 +208,7 @@ export default {
     channelManagement: 'Channels',
     channelPricing: 'Channel Pricing',
     channelMonitor: 'Channel Monitor',
+    modelFingerprint: 'Model Fingerprint',
     channelStatus: 'Channel Status',
     riskControl: 'Risk Control',
     securityAudit: 'Security Audit',
