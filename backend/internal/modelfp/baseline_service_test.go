@@ -1395,8 +1395,8 @@ func (f *failOnBaselineWriteStore) UpsertActiveBaseline(ctx context.Context, bas
 }
 
 func (f *failOnBaselineWriteStore) UpsertActiveBaselinesAtomic(ctx context.Context, baselines []Baseline) ([]Baseline, error) {
-	prev := f.MemoryStore.beforeBaselineInsert
-	f.MemoryStore.beforeBaselineInsert = func(b Baseline) error {
+	prev := f.beforeBaselineInsert
+	f.beforeBaselineInsert = func(b Baseline) error {
 		if b.DetectorKind == f.failKind {
 			return f.failErr
 		}
@@ -1406,7 +1406,7 @@ func (f *failOnBaselineWriteStore) UpsertActiveBaselinesAtomic(ctx context.Conte
 		return nil
 	}
 	defer func() {
-		f.MemoryStore.beforeBaselineInsert = prev
+		f.beforeBaselineInsert = prev
 	}()
 	return f.MemoryStore.UpsertActiveBaselinesAtomic(ctx, baselines)
 }

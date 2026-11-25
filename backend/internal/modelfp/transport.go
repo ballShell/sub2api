@@ -823,7 +823,7 @@ func extractChatContentText(raw json.RawMessage) string {
 		var sb strings.Builder
 		for _, p := range parts {
 			if p.Text != "" {
-				sb.WriteString(p.Text)
+				_, _ = sb.WriteString(p.Text)
 			}
 		}
 		return sb.String()
@@ -868,7 +868,7 @@ func parseOpenAIResponsesResponse(body []byte) (ProbeCallResult, error) {
 		}
 		for _, part := range item.Content {
 			if part.Type == "output_text" || part.Type == "text" || part.Type == "" {
-				sb.WriteString(part.Text)
+				_, _ = sb.WriteString(part.Text)
 			}
 		}
 	}
@@ -935,7 +935,7 @@ func parseAnthropicResponse(body []byte) (ProbeCallResult, error) {
 		case "thinking", "redacted_thinking":
 			hasReasoning = true
 		case "text", "":
-			sb.WriteString(block.Text)
+			_, _ = sb.WriteString(block.Text)
 		}
 	}
 
@@ -1012,7 +1012,7 @@ func parseGeminiResponse(body []byte) (ProbeCallResult, error) {
 					res.HasReasoningField = true
 					continue
 				}
-				sb.WriteString(part.Text)
+				_, _ = sb.WriteString(part.Text)
 			}
 			res.Text = sb.String()
 		}
@@ -1300,27 +1300,27 @@ func unescapeJSONSequences(s string) string {
 		if s[i] == '\\' && i+1 < len(s) {
 			switch s[i+1] {
 			case '"', '\\', '/':
-				sb.WriteByte(s[i+1])
+				_ = sb.WriteByte(s[i+1])
 				i += 2
 				continue
 			case 'b':
-				sb.WriteByte('\b')
+				_ = sb.WriteByte('\b')
 				i += 2
 				continue
 			case 'f':
-				sb.WriteByte('\f')
+				_ = sb.WriteByte('\f')
 				i += 2
 				continue
 			case 'n':
-				sb.WriteByte('\n')
+				_ = sb.WriteByte('\n')
 				i += 2
 				continue
 			case 'r':
-				sb.WriteByte('\r')
+				_ = sb.WriteByte('\r')
 				i += 2
 				continue
 			case 't':
-				sb.WriteByte('\t')
+				_ = sb.WriteByte('\t')
 				i += 2
 				continue
 			case 'u':
@@ -1332,20 +1332,20 @@ func unescapeJSONSequences(s string) string {
 								if r2, err2 := strconv.ParseUint(s[i+8:i+12], 16, 32); err2 == nil {
 									u2 := rune(r2)
 									if 0xDC00 <= u2 && u2 <= 0xDFFF {
-										sb.WriteRune(utf16.DecodeRune(u1, u2))
+										_, _ = sb.WriteRune(utf16.DecodeRune(u1, u2))
 										i += 12
 										continue
 									}
 								}
 							}
-							sb.WriteRune(unicode.ReplacementChar)
+							_, _ = sb.WriteRune(unicode.ReplacementChar)
 							i += 6
 							continue
 						}
 						if utf16.IsSurrogate(u1) {
-							sb.WriteRune(unicode.ReplacementChar)
+							_, _ = sb.WriteRune(unicode.ReplacementChar)
 						} else {
-							sb.WriteRune(u1)
+							_, _ = sb.WriteRune(u1)
 						}
 						i += 6
 						continue
@@ -1353,7 +1353,7 @@ func unescapeJSONSequences(s string) string {
 				}
 			}
 		}
-		sb.WriteByte(s[i])
+		_ = sb.WriteByte(s[i])
 		i++
 	}
 	return sb.String()

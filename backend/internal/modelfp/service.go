@@ -231,17 +231,7 @@ func (s *Service) DiscoverModels(ctx context.Context, req DiscoverModelsRequest)
 		ctx = context.Background()
 	}
 
-	resolved, err := resolveTargetInput(ctx, s.resolver, targetInputSpec{
-		TargetSource: req.TargetSource,
-		AccountID:    req.AccountID,
-		AdHoc:        req.AdHoc,
-		Protocol:     req.Protocol,
-		BaseURL:      req.BaseURL,
-		APIKey:       req.APIKey,
-		AuthMode:     req.AuthMode,
-		ProxyID:      req.ProxyID,
-		ExtraHeaders: req.ExtraHeaders,
-	})
+	resolved, err := resolveTargetInput(ctx, s.resolver, targetInputSpec(req))
 	if err != nil {
 		return nil, err
 	}

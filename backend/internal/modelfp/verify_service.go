@@ -647,7 +647,7 @@ func (s *VerifyService) executeRun(
 					return
 				}
 				if _, insErr := s.store.InsertRunItem(ctx, item); insErr != nil {
-					if !(handle.cancelled.Load() || ctx.Err() != nil) {
+					if !handle.cancelled.Load() && ctx.Err() == nil {
 						recordPersistErr(fmt.Errorf("insert run item for %s: %w", item.ClaimedModel, insErr))
 					}
 					handle.mu.Unlock()
@@ -656,7 +656,7 @@ func (s *VerifyService) executeRun(
 				handle.run.CompletedModels++
 				applyItemToSummary(&handle.run.Summary, item)
 				if updErr := s.store.UpdateRunProgress(ctx, handle.run); updErr != nil {
-					if !(handle.cancelled.Load() || ctx.Err() != nil) {
+					if !handle.cancelled.Load() && ctx.Err() == nil {
 						recordPersistErr(fmt.Errorf("update run progress: %w", updErr))
 					}
 					handle.mu.Unlock()

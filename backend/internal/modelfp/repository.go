@@ -401,7 +401,7 @@ func (s *PostgresStore) ListBaselines(ctx context.Context, filter BaselineFilter
 	}
 
 	var query strings.Builder
-	query.WriteString(`
+	_, _ = query.WriteString(`
 		SELECT b.id, b.canonical_model, b.protocol, b.suite_id,
 		       COALESCE(s.suite_key, ''), COALESCE(s.version, ''),
 		       b.detector_kind, b.source_type, b.source_label, b.upstream_snapshot,
@@ -439,10 +439,10 @@ func (s *PostgresStore) ListBaselines(ctx context.Context, filter BaselineFilter
 	}
 
 	if len(clauses) > 0 {
-		query.WriteString(" WHERE ")
-		query.WriteString(strings.Join(clauses, " AND "))
+		_, _ = query.WriteString(" WHERE ")
+		_, _ = query.WriteString(strings.Join(clauses, " AND "))
 	}
-	query.WriteString(" ORDER BY b.canonical_model ASC, b.protocol ASC, b.detector_kind ASC, b.id DESC")
+	_, _ = query.WriteString(" ORDER BY b.canonical_model ASC, b.protocol ASC, b.detector_kind ASC, b.id DESC")
 
 	rows, err := s.db.QueryContext(ctx, query.String(), args...)
 	if err != nil {
