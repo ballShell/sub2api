@@ -505,7 +505,17 @@ func TestAdminHandlerValidationErrorsReturn400(t *testing.T) {
 }
 
 func TestAdminHandlerDegradedAndNilServiceReturns503(t *testing.T) {
+	ctx := context.Background()
+
 	unstartedSvc, _ := newTestVerifyEnv(t, nil, nil, nil)
+
+	degradedSvc := NewService(nil, nil, nil, nil, nil, nil)
+	require.Error(t, degradedSvc.Start(ctx))
+
+	stoppedSvc, _ := newTestVerifyEnv(t, nil, nil, nil)
+	require.NoError(t, stoppedSvc.Start(ctx))
+	require.NoError(t, stoppedSvc.Stop())
+
 	var typedNilSvc *Service
 
 	routers := []struct {
@@ -516,6 +526,8 @@ func TestAdminHandlerDegradedAndNilServiceReturns503(t *testing.T) {
 		{name: "nil service", router: setupHandlerTestRouter(t, nil), wantReason: "MODELFP_SERVICE_UNAVAILABLE"},
 		{name: "typed nil service", router: setupHandlerTestRouter(t, typedNilSvc), wantReason: "MODELFP_SERVICE_UNAVAILABLE"},
 		{name: "unstarted service", router: setupHandlerTestRouter(t, unstartedSvc), wantReason: "MODELFP_SERVICE_NOT_READY"},
+		{name: "degraded service", router: setupHandlerTestRouter(t, degradedSvc), wantReason: "MODELFP_SERVICE_DEGRADED"},
+		{name: "stopped service", router: setupHandlerTestRouter(t, stoppedSvc), wantReason: "MODELFP_SERVICE_STOPPED"},
 	}
 
 	endpoints := []struct {
@@ -545,11 +557,44 @@ func TestAdminHandlerDegradedAndNilServiceReturns503(t *testing.T) {
 		{http.MethodDelete, "/api/v1/admin/model-fingerprint/families/gpt-4o", nil},
 	}
 
+	// Malformed JSON, invalid IDs, and invalid query params must also fail fast with 503 (never 400) when service is not ready.
+	invalidInputs := []struct {
+		method string
+		path   string
+		body   any
+	}{
+		{http.MethodPost, "/api/v1/admin/model-fingerprint/discover-models", "{"},
+		{http.MethodPost, "/api/v1/admin/model-fingerprint/runs", "{"},
+		{http.MethodGet, "/api/v1/admin/model-fingerprint/runs?page=0", nil},
+		{http.MethodGet, "/api/v1/admin/model-fingerprint/runs/bad-id", nil},
+		{http.MethodPost, "/api/v1/admin/model-fingerprint/runs/bad-id/cancel", nil},
+		{http.MethodDelete, "/api/v1/admin/model-fingerprint/runs/bad-id", nil},
+		{http.MethodGet, "/api/v1/admin/model-fingerprint/baselines?protocol=bad", nil},
+		{http.MethodPost, "/api/v1/admin/model-fingerprint/baselines/capture", "{"},
+		{http.MethodGet, "/api/v1/admin/model-fingerprint/baselines/capture/bad-id", nil},
+		{http.MethodPost, "/api/v1/admin/model-fingerprint/baselines/confusion-matrix", "{"},
+		{http.MethodPut, "/api/v1/admin/model-fingerprint/baselines/bad-id", "{"},
+		{http.MethodDelete, "/api/v1/admin/model-fingerprint/baselines/bad-id", nil},
+		{http.MethodGet, "/api/v1/admin/model-fingerprint/baselines/export?include_private=maybe", nil},
+		{http.MethodPost, "/api/v1/admin/model-fingerprint/baselines/import", "{"},
+		{http.MethodPost, "/api/v1/admin/model-fingerprint/suites", "{"},
+		{http.MethodPut, "/api/v1/admin/model-fingerprint/suites/bad-id/status", "{"},
+		{http.MethodPut, "/api/v1/admin/model-fingerprint/families/gpt-4o", "{"},
+	}
+
 	for _, rt := range routers {
 		t.Run(rt.name, func(t *testing.T) {
 			for _, ep := range endpoints {
 				rec := doHandlerJSONRequest(t, rt.router, ep.method, ep.path, ep.body)
 				require.Equalf(t, http.StatusServiceUnavailable, rec.Code, "%s %s body=%s", ep.method, ep.path, rec.Body.String())
+				var env response.Response
+				require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &env))
+				require.Equal(t, http.StatusServiceUnavailable, env.Code)
+				require.Equal(t, rt.wantReason, env.Reason)
+			}
+			for _, bad := range invalidInputs {
+				rec := doHandlerJSONRequest(t, rt.router, bad.method, bad.path, bad.body)
+				require.Equalf(t, http.StatusServiceUnavailable, rec.Code, "invalid input %s %s body=%s", bad.method, bad.path, rec.Body.String())
 				var env response.Response
 				require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &env))
 				require.Equal(t, http.StatusServiceUnavailable, env.Code)

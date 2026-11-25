@@ -53,8 +53,15 @@ func (h *AdminHandler) ensureService() (AdminService, error) {
 	if h == nil || h.service == nil {
 		return nil, infraerrors.ServiceUnavailable("MODELFP_SERVICE_UNAVAILABLE", "model fingerprint service is not configured")
 	}
-	if s, ok := h.service.(*Service); ok && s == nil {
-		return nil, infraerrors.ServiceUnavailable("MODELFP_SERVICE_UNAVAILABLE", "model fingerprint service is not configured")
+	if s, ok := h.service.(*Service); ok {
+		if s == nil {
+			return nil, infraerrors.ServiceUnavailable("MODELFP_SERVICE_UNAVAILABLE", "model fingerprint service is not configured")
+		}
+		if err := s.ensureReady(); err != nil {
+			return nil, err
+		}
+	} else if rc, ok := h.service.(interface{ IsReady() bool }); ok && !rc.IsReady() {
+		return nil, infraerrors.ServiceUnavailable("MODELFP_SERVICE_NOT_READY", "model fingerprint service is not ready")
 	}
 	return h.service, nil
 }
