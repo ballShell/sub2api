@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"net/http"
 	"sort"
 	"strings"
 	"time"
@@ -361,6 +362,10 @@ type baselineEntry struct {
 	freshness Freshness
 }
 
+type distanceReporter interface {
+	distanceWithComparable(observed *ObservedSignature, baseline Baseline) (float64, bool)
+}
+
 func adjudicateVerification(
 	out VerifyModelOutput,
 	detector Detector,
@@ -374,9 +379,20 @@ func adjudicateVerification(
 	var claimedDist float64
 	var claimedMatchThr, claimedSuspectThr float64
 
+	reporter, hasReporter := detector.(distanceReporter)
 	for i := range pool {
 		entry := pool[i]
-		d := clampFloat(detector.Distance(obs, entry.baseline), 0, 1)
+		var d float64
+		comparable := true
+		if hasReporter {
+			d, comparable = reporter.distanceWithComparable(obs, entry.baseline)
+		} else {
+			d = detector.Distance(obs, entry.baseline)
+		}
+		if !comparable {
+			continue
+		}
+		d = clampFloat(d, 0, 1)
 		matchThr, suspectThr := effectiveThresholds(entry.baseline, detector.Kind())
 		isClaimed := strings.EqualFold(entry.baseline.CanonicalModel, canonicalModel)
 		cand := CandidateScore{
@@ -755,9 +771,10 @@ func failVerifyOutput(out VerifyModelOutput, code, message string, target ProbeT
 }
 
 type probeSuccessFn func(probe ProbeDefinition, res ProbeCallResult, ev *ProbeEvidence)
+type probeSoftInapplicableFn func(res ProbeCallResult) bool
 
 // executeDetectorProbes runs all probes of kind in suite sequentially, performing hoisted
-// prompt-injection checks, secret redaction, and fatal vs. transient error handling.
+// prompt-injection checks, secret redaction, and fatal vs. transient vs. inapplicable error handling.
 func executeDetectorProbes(
 	ctx context.Context,
 	client ProbeClient,
@@ -767,6 +784,7 @@ func executeDetectorProbes(
 	kind DetectorKind,
 	requestLogprobs bool,
 	onSuccess probeSuccessFn,
+	isSoftInapplicable probeSoftInapplicableFn,
 ) (*ObservedSignature, int, error) {
 	obs := &ObservedSignature{
 		Kind:         kind,
@@ -807,6 +825,9 @@ func executeDetectorProbes(
 			}
 			if isFatalProbeError(res.ErrorCode) {
 				return obs, successCount, pErr
+			}
+			if isSoftInapplicable != nil && isSoftInapplicable(res) {
+				continue
 			}
 			lastTransientErr = pErr
 			continue
@@ -876,6 +897,39 @@ func isFatalProbeError(code string) bool {
 	default:
 		return false
 	}
+}
+
+func isLogprobsUnsupportedError(res ProbeCallResult) bool {
+	if res.LogprobsSupported || len(res.Logprobs) > 0 {
+		return false
+	}
+	if isFatalProbeError(res.ErrorCode) {
+		return false
+	}
+	switch res.ErrorCode {
+	case errorCodeRateLimited, errorCodeTimeout, errorCodeContextCanceled:
+		return false
+	}
+	switch res.HTTPStatus {
+	case http.StatusBadRequest, http.StatusUnprocessableEntity, http.StatusNotImplemented:
+		return true
+	}
+	lowerMsg := strings.ToLower(res.ErrorMessage)
+	for _, token := range []string{
+		"logprob",
+		"top_logprobs",
+		"responselogprobs",
+		"unsupported",
+		"not support",
+		"unknown parameter",
+		"unrecognized",
+		"invalid parameter",
+	} {
+		if strings.Contains(lowerMsg, token) {
+			return true
+		}
+	}
+	return false
 }
 
 func classifyContextError(err error) *ProbeError {

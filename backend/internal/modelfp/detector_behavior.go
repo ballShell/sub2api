@@ -80,6 +80,7 @@ func (d *BehaviorProtocolDetector) ProbeModel(
 				anyReasoning = true
 			}
 		},
+		nil,
 	)
 	if successCount > 0 {
 		reasoningFlag := anyReasoning
@@ -95,8 +96,13 @@ func (d *BehaviorProtocolDetector) ProbeModel(
 // Distance computes the weighted behavioral response distance combined with format compliance
 // and protocol-meta consistency signals.
 func (d *BehaviorProtocolDetector) Distance(observed *ObservedSignature, baseline Baseline) float64 {
+	dist, _ := d.distanceWithComparable(observed, baseline)
+	return dist
+}
+
+func (d *BehaviorProtocolDetector) distanceWithComparable(observed *ObservedSignature, baseline Baseline) (float64, bool) {
 	if observed == nil || !observed.Applicable || observed.Behavior == nil || baseline.Behavior == nil {
-		return 1.0
+		return 1.0, false
 	}
 
 	probeIDs := make([]string, 0, len(observed.Behavior.Probes))
@@ -129,12 +135,12 @@ func (d *BehaviorProtocolDetector) Distance(observed *ObservedSignature, baselin
 	}
 
 	if totalWeight <= 0 {
-		return 1.0
+		return 1.0, false
 	}
 
 	avgProbeDist := clampFloat(weightedSum/totalWeight, 0, 1)
 	metaPenalty := behaviorMetaMismatch(observed.Behavior, baseline)
-	return clampFloat(avgProbeDist+behaviorMetaPenaltyWeight*metaPenalty, 0, 1)
+	return clampFloat(avgProbeDist+behaviorMetaPenaltyWeight*metaPenalty, 0, 1), true
 }
 
 func closestSample(observedText string, samples []string) (string, float64) {

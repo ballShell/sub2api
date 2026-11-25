@@ -60,6 +60,7 @@ func (d *LogprobsDetector) ProbeModel(
 			ev.ObservedTopTokens = sliceTopTokens(top, 10)
 			supportedCount++
 		},
+		isLogprobsUnsupportedError,
 	)
 	if obs != nil {
 		obs.Logprobs = sig
@@ -70,8 +71,13 @@ func (d *LogprobsDetector) ProbeModel(
 
 // Distance computes the weighted average base-2 Jensen-Shannon divergence between observed and baseline.
 func (d *LogprobsDetector) Distance(observed *ObservedSignature, baseline Baseline) float64 {
+	dist, _ := d.distanceWithComparable(observed, baseline)
+	return dist
+}
+
+func (d *LogprobsDetector) distanceWithComparable(observed *ObservedSignature, baseline Baseline) (float64, bool) {
 	if observed == nil || !observed.Applicable || observed.Logprobs == nil || baseline.Logprobs == nil {
-		return 1.0
+		return 1.0, false
 	}
 
 	probeIDs := make([]string, 0, len(observed.Logprobs.Probes))
@@ -95,9 +101,9 @@ func (d *LogprobsDetector) Distance(observed *ObservedSignature, baseline Baseli
 	}
 
 	if totalWeight <= 0 {
-		return 1.0
+		return 1.0, false
 	}
-	return clampFloat(weightedSum/totalWeight, 0, 1)
+	return clampFloat(weightedSum/totalWeight, 0, 1), true
 }
 
 func aggregateLogprobsRounds(rounds []*ObservedSignature) *LogprobsSignature {

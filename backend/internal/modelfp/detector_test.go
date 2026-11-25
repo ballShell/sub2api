@@ -1203,3 +1203,226 @@ func TestDetectorsWeightedDistanceAndEvidenceAndToRunItem(t *testing.T) {
 		t.Fatalf("unexpected RunItem conversion: %+v", item)
 	}
 }
+
+func TestOrchestratorErrorShapedUnsupportedLogprobsFallback(t *testing.T) {
+	suite := makeTestSuite()
+	baselines := []Baseline{
+		{
+			ID:               901,
+			CanonicalModel:   "gpt-4o",
+			Protocol:         ProtocolOpenAIChat,
+			SuiteID:          suite.ID,
+			DetectorKind:     DetectorLogprobs,
+			Status:           StatusActive,
+			MatchThreshold:   0.08,
+			SuspectThreshold: 0.18,
+			Logprobs:         makeLogprobsSignatureFromProbes([]TokenProb{{Token: "a", Prob: 1}}, []TokenProb{{Token: "b", Prob: 1}}),
+		},
+		{
+			ID:               902,
+			CanonicalModel:   "gpt-4o",
+			Protocol:         ProtocolOpenAIChat,
+			SuiteID:          suite.ID,
+			DetectorKind:     DetectorBehavior,
+			Status:           StatusActive,
+			MatchThreshold:   0.18,
+			SuspectThreshold: 0.32,
+			Behavior: &BehaviorSignature{
+				Probes: map[string]BehaviorProbeSignature{
+					"bh-1": {ProbeID: "bh-1", Samples: []string{`{"sum":55}`}, ExpectedFormat: "json", FormatMatchRate: 1.0},
+					"bh-2": {ProbeID: "bh-2", Samples: []string{"7"}, ExpectedFormat: "integer", FormatMatchRate: 1.0},
+				},
+			},
+		},
+	}
+
+	target := ProbeTarget{
+		Protocol: ProtocolOpenAIChat,
+		BaseURL:  "https://relay.example.com/v1",
+		APIKey:   "sk-relay-key",
+	}
+
+	t.Run("HTTP 400 unsupported logprobs falls back to behavior and preserves injection warning", func(t *testing.T) {
+		client := &mockProbeClient{
+			handler: func(_ context.Context, _ ProbeTarget, _ string, probe ProbeDefinition, _ bool, _ int) ProbeCallResult {
+				if probe.Kind == DetectorLogprobs {
+					return ProbeCallResult{
+						HTTPStatus:   400,
+						ErrorCode:    errorCodeUpstreamError,
+						ErrorMessage: "logprobs is not supported for this deployment",
+						PromptTokens: 4120,
+					}
+				}
+				if probe.ID == "bh-1" {
+					return ProbeCallResult{Text: `{"sum":55}`, PromptTokens: 35, HTTPStatus: 200}
+				}
+				return ProbeCallResult{Text: "7", PromptTokens: 30, HTTPStatus: 200}
+			},
+		}
+
+		out := NewOrchestrator(client).VerifyModel(context.Background(), VerifyModelInput{
+			Target:       target,
+			ClaimedModel: "gpt-4o",
+			Suite:        suite,
+			Baselines:    baselines,
+		})
+
+		if out.Verdict != VerdictMatch {
+			t.Fatalf("expected VerdictMatch via behavior fallback, got %s (err=%s: %s)", out.Verdict, out.ErrorCode, out.ErrorMessage)
+		}
+		if out.DetectorUsed != DetectorBehavior {
+			t.Fatalf("expected DetectorBehavior, got %s", out.DetectorUsed)
+		}
+		if !out.PromptInjectionSuspected || out.ObservedPromptTokens != 4120 {
+			t.Fatalf("expected injection warning preserved (4120), got injected=%v tokens=%d", out.PromptInjectionSuspected, out.ObservedPromptTokens)
+		}
+		if len(out.Evidence) != 4 {
+			t.Fatalf("expected diagnostic logprobs + behavior evidence (4 entries), got %d", len(out.Evidence))
+		}
+	})
+
+	t.Run("HTTP 422 on logprobs falls back to behavior", func(t *testing.T) {
+		client := &mockProbeClient{
+			handler: func(_ context.Context, _ ProbeTarget, _ string, probe ProbeDefinition, _ bool, _ int) ProbeCallResult {
+				if probe.Kind == DetectorLogprobs {
+					return ProbeCallResult{HTTPStatus: 422, ErrorCode: errorCodeUpstreamError, ErrorMessage: "unprocessable entity"}
+				}
+				if probe.ID == "bh-1" {
+					return ProbeCallResult{Text: `{"sum":55}`, HTTPStatus: 200}
+				}
+				return ProbeCallResult{Text: "7", HTTPStatus: 200}
+			},
+		}
+
+		out := NewOrchestrator(client).VerifyModel(context.Background(), VerifyModelInput{
+			Target:       target,
+			ClaimedModel: "gpt-4o",
+			Suite:        suite,
+			Baselines:    baselines,
+		})
+
+		if out.Verdict != VerdictMatch || out.DetectorUsed != DetectorBehavior {
+			t.Fatalf("expected DetectorBehavior VerdictMatch on HTTP 422 logprobs error, got verdict=%s detector=%s", out.Verdict, out.DetectorUsed)
+		}
+	})
+
+	t.Run("non-unsupported HTTP 502 on logprobs still returns VerdictError without fallback", func(t *testing.T) {
+		client := &mockProbeClient{
+			handler: func(_ context.Context, _ ProbeTarget, _ string, probe ProbeDefinition, _ bool, _ int) ProbeCallResult {
+				if probe.Kind == DetectorBehavior {
+					t.Fatalf("must not fall back to behavior on 502 upstream outage")
+				}
+				return ProbeCallResult{HTTPStatus: 502, ErrorCode: errorCodeUpstreamError, ErrorMessage: "bad gateway"}
+			},
+		}
+
+		out := NewOrchestrator(client).VerifyModel(context.Background(), VerifyModelInput{
+			Target:       target,
+			ClaimedModel: "gpt-4o",
+			Suite:        suite,
+			Baselines:    baselines,
+		})
+
+		if out.Verdict != VerdictError || out.ErrorCode != errorCodeUpstreamError {
+			t.Fatalf("expected VerdictError upstream_error, got verdict=%s code=%s", out.Verdict, out.ErrorCode)
+		}
+	})
+}
+
+func TestOrchestratorSkipsNonComparableBaselinesInTopCandidates(t *testing.T) {
+	suite := makeTestSuite()
+
+	t.Run("logprobs skips zero-overlap baseline in TopCandidates", func(t *testing.T) {
+		baselines := []Baseline{
+			{
+				ID:               1001,
+				CanonicalModel:   "gpt-4o",
+				Protocol:         ProtocolOpenAIChat,
+				SuiteID:          suite.ID,
+				DetectorKind:     DetectorLogprobs,
+				Status:           StatusActive,
+				MatchThreshold:   0.08,
+				SuspectThreshold: 0.18,
+				Logprobs:         makeLogprobsSignatureFromProbes([]TokenProb{{Token: "a", Prob: 1}}, []TokenProb{{Token: "b", Prob: 1}}),
+			},
+			{
+				ID:               1002,
+				CanonicalModel:   "non-comparable-model",
+				Protocol:         ProtocolOpenAIChat,
+				SuiteID:          suite.ID,
+				DetectorKind:     DetectorLogprobs,
+				Status:           StatusActive,
+				MatchThreshold:   0.08,
+				SuspectThreshold: 0.18,
+				Logprobs: &LogprobsSignature{
+					Probes: map[string]LogprobsProbeSignature{
+						"other-probe-only": {ProbeID: "other-probe-only", Distribution: map[string]float64{"x": 1.0}},
+					},
+				},
+			},
+		}
+
+		client := &mockProbeClient{
+			handler: func(_ context.Context, _ ProbeTarget, _ string, probe ProbeDefinition, _ bool, _ int) ProbeCallResult {
+				if probe.ID == "lp-1" {
+					return ProbeCallResult{Logprobs: []TokenProb{{Token: "a", Prob: 1}}, LogprobsSupported: true, HTTPStatus: 200}
+				}
+				return ProbeCallResult{Logprobs: []TokenProb{{Token: "b", Prob: 1}}, LogprobsSupported: true, HTTPStatus: 200}
+			},
+		}
+
+		out := NewOrchestrator(client).VerifyModel(context.Background(), VerifyModelInput{
+			Target:       ProbeTarget{Protocol: ProtocolOpenAIChat, BaseURL: "https://api.example.com/v1", APIKey: "sk-key"},
+			ClaimedModel: "gpt-4o",
+			Suite:        suite,
+			Baselines:    baselines,
+		})
+
+		if out.Verdict != VerdictMatch {
+			t.Fatalf("expected VerdictMatch, got %s", out.Verdict)
+		}
+		if len(out.TopCandidates) != 1 || out.TopCandidates[0].CanonicalModel != "gpt-4o" {
+			t.Fatalf("expected non-comparable baseline skipped from TopCandidates, got %+v", out.TopCandidates)
+		}
+	})
+
+	t.Run("behavior skips zero-overlap baselines and marks unverified when none comparable", func(t *testing.T) {
+		baselines := []Baseline{
+			{
+				ID:               1003,
+				CanonicalModel:   "claude-opus-4-6",
+				Protocol:         ProtocolAnthropic,
+				SuiteID:          suite.ID,
+				DetectorKind:     DetectorBehavior,
+				Status:           StatusActive,
+				MatchThreshold:   0.18,
+				SuspectThreshold: 0.32,
+				Behavior: &BehaviorSignature{
+					Probes: map[string]BehaviorProbeSignature{
+						"disjoint-probe": {ProbeID: "disjoint-probe", Samples: []string{"foo"}},
+					},
+				},
+			},
+		}
+
+		client := &mockProbeClient{
+			handler: func(_ context.Context, _ ProbeTarget, _ string, probe ProbeDefinition, _ bool, _ int) ProbeCallResult {
+				return ProbeCallResult{Text: "7", HTTPStatus: 200}
+			},
+		}
+
+		out := NewOrchestrator(client).VerifyModel(context.Background(), VerifyModelInput{
+			Target:       ProbeTarget{Protocol: ProtocolAnthropic, BaseURL: "https://api.anthropic.com", APIKey: "sk-ant-key"},
+			ClaimedModel: "claude-opus-4-6",
+			Suite:        suite,
+			Baselines:    baselines,
+		})
+
+		if out.Verdict != VerdictUnverified {
+			t.Fatalf("expected VerdictUnverified when claimed baseline shares zero probe IDs, got %s", out.Verdict)
+		}
+		if len(out.TopCandidates) != 0 {
+			t.Fatalf("expected empty TopCandidates when no baselines are comparable, got %+v", out.TopCandidates)
+		}
+	})
+}
