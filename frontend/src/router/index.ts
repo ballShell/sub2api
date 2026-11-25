@@ -514,6 +514,18 @@ const routes: RouteRecordRaw[] = [
     }
   },
   {
+    path: '/admin/model-fingerprint',
+    name: 'AdminModelFingerprint',
+    component: () => import('@/features/model-fingerprint/ModelFingerprintView.vue'),
+    meta: {
+      requiresAuth: true,
+      requiresAdmin: true,
+      title: 'Model Fingerprint Verification',
+      titleKey: 'admin.modelFingerprint.title',
+      descriptionKey: 'admin.modelFingerprint.description'
+    }
+  },
+  {
     path: '/monitor',
     name: 'ChannelStatus',
     component: () => import('@/views/user/ChannelStatusView.vue'),

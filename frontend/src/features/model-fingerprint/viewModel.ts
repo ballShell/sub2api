@@ -1,10 +1,13 @@
+import { extractApiErrorCode, extractApiErrorMessage } from '@/utils/apiError'
 import type {
+  AdHocTargetInput,
   BaselineFilter,
   ConfusionMatrixResult,
   Freshness,
   Protocol,
   RunItem,
   RunStatus,
+  TargetSource,
   Verdict,
   WhitelistFormat,
 } from './types'
@@ -296,5 +299,144 @@ export function confusionCellMeta(
     tone: 'clear',
     cellClass:
       'bg-emerald-50/70 text-emerald-800 dark:bg-emerald-950/25 dark:text-emerald-300',
+  }
+}
+
+/**
+ * Infers the default upstream wire protocol from an eligible account's platform and extra flags,
+ * mirroring backend account_resolver.go `resolveAccountProtocol`.
+ */
+export function inferAccountProtocol(account?: {
+  platform?: string | null
+  extra?: Record<string, unknown> | null
+} | null): Protocol {
+  if (!account) return 'openai_chat'
+  const platform = (account.platform ?? '').trim().toLowerCase()
+  const extra = account.extra ?? {}
+  if (platform === 'anthropic') {
+    return 'anthropic'
+  }
+  if (platform === 'gemini') {
+    return 'gemini'
+  }
+  if (platform === 'openai') {
+    if (extra.openai_responses_enabled === true || extra.api_protocol === 'responses') {
+      return 'openai_responses'
+    }
+    return 'openai_chat'
+  }
+  const apiProto = typeof extra.api_protocol === 'string' ? extra.api_protocol.trim().toLowerCase() : ''
+  if (apiProto === 'anthropic') return 'anthropic'
+  if (apiProto === 'responses') return 'openai_responses'
+  return 'openai_chat'
+}
+
+/**
+ * Parses an optional JSON string into a string-valued HTTP header map.
+ */
+export function parseExtraHeadersJson(raw: string): {
+  headers: Record<string, string> | undefined
+  valid: boolean
+} {
+  const trimmed = raw.trim()
+  if (!trimmed) {
+    return { headers: undefined, valid: true }
+  }
+  try {
+    const parsed: unknown = JSON.parse(trimmed)
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      return { headers: undefined, valid: false }
+    }
+    const headers: Record<string, string> = {}
+    for (const [k, v] of Object.entries(parsed)) {
+      if (typeof v !== 'string') {
+        return { headers: undefined, valid: false }
+      }
+      const key = k.trim()
+      if (key) {
+        headers[key] = v
+      }
+    }
+    return {
+      headers: Object.keys(headers).length > 0 ? headers : undefined,
+      valid: true,
+    }
+  } catch {
+    return { headers: undefined, valid: false }
+  }
+}
+
+/**
+ * Resolves localized model-fingerprint error messages from backend `MODELFP_*` error codes.
+ */
+export function formatModelFpError(
+  error: unknown,
+  t: (key: string, params?: Record<string, unknown>) => string,
+  fallbackKey: string,
+): string {
+  const code = extractApiErrorCode(error)
+  if (code) {
+    const key = `admin.modelFingerprint.errors.${code}`
+    const translated = t(key)
+    if (translated !== key) {
+      return translated
+    }
+  }
+  return extractApiErrorMessage(error, t(fallbackKey))
+}
+
+/**
+ * Formats an ISO timestamp string cleanly for display, returning '—' when absent or invalid.
+ */
+export function formatDateTime(value?: string | null, locale = 'en'): string {
+  if (!value) return '—'
+  const date = new Date(value)
+  if (Number.isNaN(date.getTime())) return '—'
+  return new Intl.DateTimeFormat(locale, {
+    dateStyle: 'medium',
+    timeStyle: 'short',
+  }).format(date)
+}
+
+export interface TargetFormFields {
+  targetSource: TargetSource
+  accountId: number | null
+  accountProtocol: Protocol
+  adhocProtocol: Protocol
+  baseUrl: string
+  apiKey: string
+  authMode: string
+  proxyId: number | null
+  extraHeaders?: Record<string, string>
+}
+
+/**
+ * Builds the shared target payload fields expected by discoverModels, createRun, and startCapture.
+ */
+export function buildTargetPayload(fields: TargetFormFields): {
+  target_source: TargetSource
+  account_id?: number
+  protocol: Protocol
+  adhoc?: AdHocTargetInput
+} {
+  if (fields.targetSource === 'account') {
+    return {
+      target_source: 'account',
+      account_id: fields.accountId ?? undefined,
+      protocol: fields.accountProtocol,
+    }
+  }
+  const adhoc: AdHocTargetInput = {
+    protocol: fields.adhocProtocol,
+    base_url: fields.baseUrl.trim(),
+    api_key: fields.apiKey.trim(),
+    auth_mode: fields.authMode || undefined,
+    proxy_id: fields.proxyId ?? undefined,
+    extra_headers: fields.extraHeaders,
+  }
+  return {
+    target_source: 'adhoc',
+    protocol: fields.adhocProtocol,
+    adhoc,
   }
 }
