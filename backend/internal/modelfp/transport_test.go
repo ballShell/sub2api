@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -50,6 +51,28 @@ func TestValidateBaseURLBlocksSSRF(t *testing.T) {
 		}
 	}
 
+	// Verify DNS resolution inside ValidateBaseURL rejects non-literal hostnames resolving to blocked IPs.
+	for _, tc := range []struct {
+		host string
+		ip   string
+	}{
+		{"loopback-dns.example.com", "127.0.0.1"},
+		{"rfc1918-dns.example.com", "10.20.30.40"},
+		{"metadata-dns.example.com", "169.254.169.254"},
+		{"cgnat-dns.example.com", "100.64.10.1"},
+		{"ula-dns.example.com", "fc00::1"},
+	} {
+		_, err := validateBaseURLWithLookup(context.Background(), "https://"+tc.host+"/v1", false, func(_ context.Context, _, host string) ([]netip.Addr, error) {
+			if host != tc.host {
+				t.Fatalf("unexpected DNS lookup host %q", host)
+			}
+			return []netip.Addr{netip.MustParseAddr(tc.ip)}, nil
+		})
+		if !errors.Is(err, ErrSSRFBlocked) {
+			t.Fatalf("expected ValidateBaseURL DNS check to block %s (%s), got %v", tc.host, tc.ip, err)
+		}
+	}
+
 	allowed := []string{
 		"https://api.example.com",
 		"https://api.openai.com/v1/",
@@ -57,7 +80,9 @@ func TestValidateBaseURLBlocksSSRF(t *testing.T) {
 		"https://[2606:4700:4700::1111]/v1",
 	}
 	for _, u := range allowed {
-		parsed, err := ValidateBaseURL(context.Background(), u)
+		parsed, err := validateBaseURLWithLookup(context.Background(), u, false, func(_ context.Context, _, _ string) ([]netip.Addr, error) {
+			return []netip.Addr{netip.MustParseAddr("93.184.216.34")}, nil
+		})
 		if err != nil {
 			t.Fatalf("expected %q to be allowed, got %v", u, err)
 		}
@@ -67,10 +92,14 @@ func TestValidateBaseURLBlocksSSRF(t *testing.T) {
 	}
 }
 
-func TestSSRFSafeTransportDialContext(t *testing.T) {
-	tr, err := newSSRFSafeTransport("", false)
+func TestSSRFSafeTransportDialContextAndProxy(t *testing.T) {
+	rt, err := newSSRFSafeTransport("", false)
 	if err != nil {
 		t.Fatalf("newSSRFSafeTransport failed: %v", err)
+	}
+	tr, ok := rt.(*http.Transport)
+	if !ok {
+		t.Fatalf("expected *http.Transport for direct SSRF transport, got %T", rt)
 	}
 	if tr.Proxy != nil {
 		t.Fatalf("expected direct SSRF transport Proxy to be nil")
@@ -121,6 +150,35 @@ func TestSSRFSafeTransportDialContext(t *testing.T) {
 		t.Fatalf("expected DNS rebinding check to block mixed public+metadata IPs, got err=%v", dialErr)
 	}
 
+	// Verify proxied requests enforce destination IP/DNS policy BEFORE forwarding through the proxy.
+	var proxyHits atomic.Int32
+	proxySrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		proxyHits.Add(1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer proxySrv.Close()
+
+	proxiedClient := NewHTTPProbeClient(withLookupNetIPForTest(func(_ context.Context, _, host string) ([]netip.Addr, error) {
+		if host == "internal-only.example.com" {
+			return []netip.Addr{netip.MustParseAddr("10.0.0.5")}, nil
+		}
+		return nil, errors.New("nxdomain")
+	}))
+	for _, targetURL := range []string{"http://internal-only.example.com", "http://unresolvable-vpc.corp"} {
+		res := proxiedClient.ExecuteProbe(context.Background(), ProbeTarget{
+			Protocol: ProtocolOpenAIChat,
+			BaseURL:  targetURL,
+			APIKey:   "sk-proxied-secret",
+			ProxyURL: proxySrv.URL,
+		}, "gpt-4o", ProbeDefinition{ID: "p1", Kind: DetectorBehavior, Prompt: "hi", MaxTokens: 16}, false)
+		if res.ErrorCode != "ssrf_blocked" {
+			t.Fatalf("expected proxied SSRF target %s blocked with ssrf_blocked, got %+v", targetURL, res)
+		}
+	}
+	if proxyHits.Load() != 0 {
+		t.Fatalf("expected proxy to receive 0 requests for SSRF targets, got %d", proxyHits.Load())
+	}
+
 	// Verify HTTP 302 redirect to metadata IP is blocked even when AllowLoopbackForTest is enabled.
 	redirectSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "http://169.254.169.254/latest/meta-data", http.StatusFound)
@@ -139,6 +197,49 @@ func TestSSRFSafeTransportDialContext(t *testing.T) {
 	}
 }
 
+func TestCrossOriginRedirectBlockedWithoutCredentialLeak(t *testing.T) {
+	var evilHits atomic.Int32
+	evilSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		evilHits.Add(1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer evilSrv.Close()
+
+	redirector := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, evilSrv.URL+"/steal", http.StatusTemporaryRedirect)
+	}))
+	defer redirector.Close()
+
+	client := NewHTTPProbeClient(WithAllowLoopbackForTest())
+	res := client.ExecuteProbe(context.Background(), ProbeTarget{
+		Protocol:     ProtocolAnthropic,
+		BaseURL:      redirector.URL,
+		APIKey:       "sk-ant-redirect-secret",
+		ExtraHeaders: map[string]string{"X-Custom-Secret": "hdr-secret-999"},
+	}, "claude-sonnet-4-6", ProbeDefinition{ID: "p1", Kind: DetectorBehavior, Prompt: "hi", MaxTokens: 16}, false)
+
+	if res.ErrorCode != "ssrf_blocked" {
+		t.Fatalf("expected cross-origin redirect to return ssrf_blocked, got %+v", res)
+	}
+	if evilHits.Load() != 0 {
+		t.Fatalf("expected cross-origin target not to receive credentials, got %d hits", evilHits.Load())
+	}
+	if strings.Contains(res.ErrorMessage, "sk-ant-redirect-secret") || strings.Contains(res.ErrorMessage, "hdr-secret-999") {
+		t.Fatalf("cross-origin redirect error leaked secrets: %s", res.ErrorMessage)
+	}
+
+	if _, err := client.DiscoverModels(context.Background(), ProbeTarget{
+		Protocol: ProtocolGemini,
+		BaseURL:  redirector.URL,
+		APIKey:   "gem-redirect-secret",
+	}); !errors.Is(err, ErrSSRFBlocked) {
+		t.Fatalf("expected DiscoverModels cross-origin redirect to return ErrSSRFBlocked, got %v", err)
+	}
+	if evilHits.Load() != 0 {
+		t.Fatalf("expected DiscoverModels cross-origin redirect not to reach evilSrv, got %d hits", evilHits.Load())
+	}
+}
+
 func TestNormalizeProtocolEndpoint(t *testing.T) {
 	// Review Focus #1: never produce /v1/v1/... and preserve custom prefixes
 	cases := []struct {
@@ -154,6 +255,7 @@ func TestNormalizeProtocolEndpoint(t *testing.T) {
 		{"https://generativelanguage.googleapis.com", "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro:generateContent", ProtocolGemini, "gemini-2.5-pro", false},
 		{"https://generativelanguage.googleapis.com/v1beta/", "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro:generateContent", ProtocolGemini, "gemini-2.5-pro", false},
 		{"https://generativelanguage.googleapis.com/v1beta", "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro:generateContent", ProtocolGemini, "models/gemini-2.5-pro", false},
+		{"https://generativelanguage.googleapis.com/v1beta", "https://generativelanguage.googleapis.com/v1beta/models/org%2Fgemini%20custom:generateContent", ProtocolGemini, "org/gemini custom", false},
 		{"https://open.bigmodel.cn/api/paas/v4/", "https://open.bigmodel.cn/api/paas/v4/chat/completions", ProtocolOpenAIChat, "glm-4", false},
 		{"https://api.example.com/openai", "https://api.example.com/openai/v1/chat/completions", ProtocolOpenAIChat, "gpt-4o", false},
 		// Discovery URLs
@@ -167,6 +269,9 @@ func TestNormalizeProtocolEndpoint(t *testing.T) {
 		got, err := NormalizeProtocolEndpoint(tc.base, tc.proto, tc.model, tc.forDiscovery)
 		if err != nil || got != tc.want {
 			t.Fatalf("base=%s proto=%s discovery=%v: got %q (%v), want %q", tc.base, tc.proto, tc.forDiscovery, got, err, tc.want)
+		}
+		if strings.Contains(got, "%25") {
+			t.Fatalf("detected double-escaped percent encoding in %q", got)
 		}
 	}
 
@@ -292,6 +397,36 @@ func TestTransportErrorRedactsAPIKey(t *testing.T) {
 		t.Fatalf("expected [REDACTED] placeholder in error message, got %q", res.ErrorMessage)
 	}
 
+	// Non-JSON HTML or arbitrary JSON without envelope must not echo raw body.
+	rawHTMLSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusBadGateway)
+		_, _ = w.Write([]byte(`<html><body>upstream failed for sk-html-secret-777</body></html>`))
+	}))
+	defer rawHTMLSrv.Close()
+	htmlRes := client.ExecuteProbe(context.Background(), ProbeTarget{
+		Protocol: ProtocolOpenAIChat, BaseURL: rawHTMLSrv.URL, APIKey: "sk-html-secret-777",
+	}, "gpt-4o", ProbeDefinition{ID: "p1", Kind: DetectorBehavior, Prompt: "hi", MaxTokens: 16}, false)
+	if htmlRes.ErrorCode != "upstream_error" || strings.Contains(htmlRes.ErrorMessage, "<html>") || strings.Contains(htmlRes.ErrorMessage, "sk-html-secret-777") {
+		t.Fatalf("expected status-only error for non-JSON body, got %+v", htmlRes)
+	}
+	if htmlRes.ErrorMessage != "upstream HTTP 502 Bad Gateway" {
+		t.Fatalf("unexpected non-JSON error message: %q", htmlRes.ErrorMessage)
+	}
+
+	// JSON-escaped secrets in error messages or wrapped error strings must be redacted.
+	escapedSecret := `sk-<secret>&"999`
+	escapedSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = w.Write([]byte(`{"error":{"message":"invalid key sk-\\u003csecret\\u003e\\u0026\\\"999 and sk-\u003csecret\u003e\u0026\"999"}}`))
+	}))
+	defer escapedSrv.Close()
+	escRes := client.ExecuteProbe(context.Background(), ProbeTarget{
+		Protocol: ProtocolOpenAIChat, BaseURL: escapedSrv.URL, APIKey: escapedSecret,
+	}, "gpt-4o", ProbeDefinition{ID: "p1", Kind: DetectorBehavior, Prompt: "hi", MaxTokens: 16}, false)
+	if escRes.ErrorCode != "auth_error" || strings.Contains(escRes.ErrorMessage, "secret") {
+		t.Fatalf("expected JSON-escaped secret redacted, got %+v", escRes)
+	}
+
 	// Also check DiscoverModels redaction and HTTP error taxonomy
 	statusCases := []struct {
 		status int
@@ -415,6 +550,7 @@ func TestProtocolAdapters(t *testing.T) {
 						],
 						"usage": {
 							"input_tokens": 42,
+							"cache_creation_input_tokens": 100,
 							"cache_read_input_tokens": 4096,
 							"output_tokens": 11
 						}
@@ -430,8 +566,8 @@ func TestProtocolAdapters(t *testing.T) {
 				if res.ErrorCode != "" || res.Text != "{\"sum\":55}" || !res.HasReasoningField {
 					t.Fatalf("unexpected anthropic result: %+v", res)
 				}
-				if res.PromptTokens != 42 || res.CachedPromptTokens != 4096 || res.OutputTokens != 11 {
-					t.Fatalf("unexpected anthropic usage: %+v", res)
+				if res.PromptTokens != 4238 || res.CachedPromptTokens != 4096 || res.OutputTokens != 11 {
+					t.Fatalf("unexpected anthropic usage (want PromptTokens=4238 CachedPromptTokens=4096 OutputTokens=11): %+v", res)
 				}
 			})
 		}
@@ -556,7 +692,64 @@ func TestDiscoverModelsAllProtocols(t *testing.T) {
 		})
 	}
 
-	t.Run("gemini", func(t *testing.T) {
+	t.Run("anthropic_pagination_and_page_bound", func(t *testing.T) {
+		var calls int32
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			n := atomic.AddInt32(&calls, 1)
+			after := r.URL.Query().Get("after_id")
+			switch n {
+			case 1:
+				if after != "" {
+					t.Fatalf("unexpected after_id on page 1: %q", after)
+				}
+				_, _ = w.Write([]byte(`{"data":[{"id":"claude-opus-4-6"}],"has_more":true,"last_id":"cur_1"}`))
+			case 2:
+				if after != "cur_1" {
+					t.Fatalf("expected after_id=cur_1 on page 2, got %q", after)
+				}
+				_, _ = w.Write([]byte(`{"data":[{"id":"claude-sonnet-4-6"},{"id":"claude-opus-4-6"}],"has_more":true,"last_id":"cur_2"}`))
+			case 3:
+				if after != "cur_2" {
+					t.Fatalf("expected after_id=cur_2 on page 3, got %q", after)
+				}
+				_, _ = w.Write([]byte(`{"data":[{"id":"claude-haiku-4-5"}],"has_more":false,"last_id":"cur_3"}`))
+			default:
+				t.Fatalf("unexpected extra page call %d", n)
+			}
+		}))
+		defer srv.Close()
+
+		models, err := client.DiscoverModels(context.Background(), ProbeTarget{
+			Protocol: ProtocolAnthropic, BaseURL: srv.URL, APIKey: "ant-page-key",
+		})
+		if err != nil {
+			t.Fatalf("DiscoverModels anthropic paginated failed: %v", err)
+		}
+		if len(models) != 3 || models[0] != "claude-opus-4-6" || models[1] != "claude-sonnet-4-6" || models[2] != "claude-haiku-4-5" {
+			t.Fatalf("unexpected paginated anthropic models: %v", models)
+		}
+
+		// Verify infinite pagination stops at maxDiscoverModelPages (10).
+		var loopCalls int32
+		loopSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			idx := atomic.AddInt32(&loopCalls, 1)
+			_, _ = fmt.Fprintf(w, `{"data":[{"id":"m-%d"}],"has_more":true,"last_id":"cur_%d"}`, idx, idx)
+		}))
+		defer loopSrv.Close()
+
+		capped, err := client.DiscoverModels(context.Background(), ProbeTarget{
+			Protocol: ProtocolAnthropic, BaseURL: loopSrv.URL, APIKey: "ant-loop-key",
+		})
+		if err != nil {
+			t.Fatalf("DiscoverModels capped pagination failed: %v", err)
+		}
+		if loopCalls != maxDiscoverModelPages || len(capped) != maxDiscoverModelPages {
+			t.Fatalf("expected exactly %d pages/models, got calls=%d len=%d", maxDiscoverModelPages, loopCalls, len(capped))
+		}
+	})
+
+	t.Run("gemini_and_pagination", func(t *testing.T) {
+		var calls int32
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			if r.Method != http.MethodGet || r.URL.Path != "/v1beta/models" {
 				t.Fatalf("unexpected %s %s", r.Method, r.URL.Path)
@@ -564,13 +757,43 @@ func TestDiscoverModelsAllProtocols(t *testing.T) {
 			if r.Header.Get("x-goog-api-key") != "gem-key" {
 				t.Fatalf("missing x-goog-api-key")
 			}
-			_, _ = w.Write([]byte(`{
-				"models": [
-					{"name": "models/gemini-2.5-pro", "supportedGenerationMethods": ["generateContent", "countTokens"]},
-					{"name": "models/text-embedding-004", "supportedGenerationMethods": ["embedContent"]},
-					{"name": "models/gemini-2.5-flash"}
-				]
-			}`))
+			n := atomic.AddInt32(&calls, 1)
+			pageToken := r.URL.Query().Get("pageToken")
+			switch n {
+			case 1:
+				if pageToken != "" {
+					t.Fatalf("unexpected pageToken on first call: %q", pageToken)
+				}
+				_, _ = w.Write([]byte(`{
+					"models": [
+						{"name": "models/gemini-2.5-pro", "supportedGenerationMethods": ["generateContent", "countTokens"]},
+						{"name": "models/text-embedding-004", "supportedGenerationMethods": ["embedContent"]}
+					],
+					"nextPageToken": "tok_2"
+				}`))
+			case 2:
+				if pageToken != "tok_2" {
+					t.Fatalf("expected pageToken=tok_2, got %q", pageToken)
+				}
+				_, _ = w.Write([]byte(`{
+					"models": [
+						{"name": "models/gemini-2.5-flash"},
+						{"name": "models/gemini-2.5-pro"}
+					],
+					"nextPageToken": "tok_3"
+				}`))
+			case 3:
+				if pageToken != "tok_3" {
+					t.Fatalf("expected pageToken=tok_3, got %q", pageToken)
+				}
+				_, _ = w.Write([]byte(`{
+					"models": [
+						{"name": "models/gemini-2.5-flash-lite", "supportedGenerationMethods": ["generateContent"]}
+					]
+				}`))
+			default:
+				t.Fatalf("unexpected extra gemini page call %d", n)
+			}
 		}))
 		defer srv.Close()
 
@@ -580,14 +803,14 @@ func TestDiscoverModelsAllProtocols(t *testing.T) {
 		if err != nil {
 			t.Fatalf("DiscoverModels gemini failed: %v", err)
 		}
-		if len(models) != 2 || models[0] != "gemini-2.5-pro" || models[1] != "gemini-2.5-flash" {
+		if len(models) != 3 || models[0] != "gemini-2.5-pro" || models[1] != "gemini-2.5-flash" || models[2] != "gemini-2.5-flash-lite" {
 			t.Fatalf("unexpected gemini models: %v", models)
 		}
 	})
 }
 
 func TestResponseBody256KBLimit(t *testing.T) {
-	oversized := strings.Repeat("x", (256<<10)+1024)
+	oversized := strings.Repeat("x", maxResponseBodyBytes+1024)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/v1/models" {
 			_, _ = w.Write([]byte(`{"data":[{"id":"` + oversized + `"}]}`))

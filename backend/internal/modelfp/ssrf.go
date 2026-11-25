@@ -71,10 +71,28 @@ type lookupNetIPFunc func(ctx context.Context, network, host string) ([]netip.Ad
 
 // ValidateBaseURL parses and validates an outbound upstream base URL against SSRF rules.
 func ValidateBaseURL(ctx context.Context, rawURL string) (*url.URL, error) {
-	return validateBaseURL(ctx, rawURL, false)
+	return validateBaseURLWithLookup(ctx, rawURL, false, net.DefaultResolver.LookupNetIP)
 }
 
-func validateBaseURL(ctx context.Context, rawURL string, allowLoopback bool) (*url.URL, error) {
+func validateBaseURLWithLookup(
+	ctx context.Context,
+	rawURL string,
+	allowLoopback bool,
+	lookupFn lookupNetIPFunc,
+) (*url.URL, error) {
+	parsed, err := parseBaseURL(ctx, rawURL)
+	if err != nil {
+		return nil, err
+	}
+	if err := validateResolvedDestination(ctx, parsed.Hostname(), allowLoopback, false, lookupFn); err != nil {
+		return nil, err
+	}
+	parsed.Path = strings.TrimRight(parsed.Path, "/")
+	parsed.RawPath = ""
+	return parsed, nil
+}
+
+func parseBaseURL(ctx context.Context, rawURL string) (*url.URL, error) {
 	if ctx != nil {
 		if err := ctx.Err(); err != nil {
 			return nil, err
@@ -91,41 +109,103 @@ func validateBaseURL(ctx context.Context, rawURL string, allowLoopback bool) (*u
 		return nil, fmt.Errorf("%w: invalid URL syntax", ErrSSRFBlocked)
 	}
 
+	if parsed.RawQuery != "" || parsed.Fragment != "" {
+		return nil, fmt.Errorf("%w: base URL must not contain query parameters or fragments", ErrSSRFBlocked)
+	}
+	if err := validateOutboundParsedURL(parsed); err != nil {
+		return nil, err
+	}
+	return parsed, nil
+}
+
+func validateOutboundParsedURL(parsed *url.URL) error {
+	if parsed == nil {
+		return fmt.Errorf("%w: URL is required", ErrSSRFBlocked)
+	}
 	scheme := strings.ToLower(strings.TrimSpace(parsed.Scheme))
 	if scheme != "http" && scheme != "https" {
-		return nil, fmt.Errorf("%w: unsupported URL scheme %q", ErrSSRFBlocked, scheme)
+		return fmt.Errorf("%w: unsupported URL scheme %q", ErrSSRFBlocked, scheme)
 	}
 	parsed.Scheme = scheme
 
 	if parsed.User != nil {
-		return nil, fmt.Errorf("%w: URL must not contain userinfo", ErrSSRFBlocked)
+		return fmt.Errorf("%w: URL must not contain userinfo", ErrSSRFBlocked)
 	}
-	if parsed.RawQuery != "" || parsed.Fragment != "" {
-		return nil, fmt.Errorf("%w: base URL must not contain query parameters or fragments", ErrSSRFBlocked)
-	}
-	if parsed.Host == "" {
-		return nil, fmt.Errorf("%w: URL host is required", ErrSSRFBlocked)
-	}
-
-	host := strings.TrimSpace(parsed.Hostname())
-	if host == "" {
-		return nil, fmt.Errorf("%w: URL host is required", ErrSSRFBlocked)
+	if parsed.Host == "" || strings.TrimSpace(parsed.Hostname()) == "" {
+		return fmt.Errorf("%w: URL host is required", ErrSSRFBlocked)
 	}
 
 	if portStr := parsed.Port(); portStr != "" {
 		port, err := strconv.Atoi(portStr)
 		if err != nil || port <= 0 || port > 65535 {
-			return nil, fmt.Errorf("%w: invalid port %q", ErrSSRFBlocked, portStr)
+			return fmt.Errorf("%w: invalid port %q", ErrSSRFBlocked, portStr)
 		}
 	}
+	return nil
+}
 
-	if err := validateHostLiteral(host, allowLoopback); err != nil {
-		return nil, err
+func validateOutboundRequestURL(
+	ctx context.Context,
+	parsed *url.URL,
+	allowLoopback bool,
+	failClosedOnDNSError bool,
+	lookupFn lookupNetIPFunc,
+) error {
+	if err := validateOutboundParsedURL(parsed); err != nil {
+		return err
 	}
+	return validateResolvedDestination(ctx, parsed.Hostname(), allowLoopback, failClosedOnDNSError, lookupFn)
+}
 
-	parsed.Path = strings.TrimRight(parsed.Path, "/")
-	parsed.RawPath = ""
-	return parsed, nil
+func validateResolvedDestination(
+	ctx context.Context,
+	host string,
+	allowLoopback bool,
+	failClosedOnDNSError bool,
+	lookupFn lookupNetIPFunc,
+) error {
+	if err := validateHostLiteral(host, allowLoopback); err != nil {
+		return err
+	}
+	cleanHost := normalizeHost(host)
+	if _, err := netip.ParseAddr(cleanHost); err == nil {
+		return nil
+	}
+	if allowLoopback {
+		return nil
+	}
+	if lookupFn == nil {
+		lookupFn = net.DefaultResolver.LookupNetIP
+	}
+	parentCtx := ctx
+	if parentCtx == nil {
+		parentCtx = context.Background()
+	}
+	lookupCtx, cancel := context.WithTimeout(parentCtx, ssrfDNSLookupTimeout)
+	defer cancel()
+
+	addrs, err := lookupFn(lookupCtx, "ip", cleanHost)
+	if err != nil {
+		if parentCtx.Err() != nil {
+			return parentCtx.Err()
+		}
+		if failClosedOnDNSError {
+			return fmt.Errorf("%w: resolve destination host %q failed", ErrSSRFBlocked, cleanHost)
+		}
+		return nil
+	}
+	if len(addrs) == 0 {
+		if failClosedOnDNSError {
+			return fmt.Errorf("%w: destination host %q resolved to no addresses", ErrSSRFBlocked, cleanHost)
+		}
+		return nil
+	}
+	for _, ip := range addrs {
+		if isBlockedAddr(ip, allowLoopback) {
+			return fmt.Errorf("%w: host %q resolved to blocked IP %s", ErrSSRFBlocked, cleanHost, ip.Unmap().String())
+		}
+	}
+	return nil
 }
 
 func validateHostLiteral(host string, allowLoopback bool) error {
@@ -206,7 +286,15 @@ func matchesAnyPrefix(addr netip.Addr, prefixes []netip.Prefix) bool {
 	return false
 }
 
-func newSSRFSafeTransport(proxyURL string, allowLoopback bool) (*http.Transport, error) {
+func newSSRFSafeTransport(proxyURL string, allowLoopback bool) (http.RoundTripper, error) {
+	return newSSRFSafeTransportWithLookup(proxyURL, allowLoopback, nil)
+}
+
+func newSSRFSafeTransportWithLookup(
+	proxyURL string,
+	allowLoopback bool,
+	lookupFn lookupNetIPFunc,
+) (http.RoundTripper, error) {
 	tr := &http.Transport{
 		// Never inherit HTTP_PROXY/HTTPS_PROXY from environment so direct probes
 		// cannot bypass socket-level DNS/IP validation.
@@ -225,14 +313,39 @@ func newSSRFSafeTransport(proxyURL string, allowLoopback bool) (*http.Transport,
 		return nil, fmt.Errorf("parse proxy URL: %w", err)
 	}
 	if parsedProxy == nil {
-		tr.DialContext = newSSRFSafeDialContextWithLookup(allowLoopback, nil)
+		tr.DialContext = newSSRFSafeDialContextWithLookup(allowLoopback, lookupFn)
 		return tr, nil
 	}
 
 	if err := proxyutil.ConfigureTransportProxy(tr, parsedProxy); err != nil {
 		return nil, fmt.Errorf("configure proxy transport: %w", err)
 	}
-	return tr, nil
+	return &proxiedSSRFTransport{
+		base:          tr,
+		allowLoopback: allowLoopback,
+		lookupFn:      lookupFn,
+	}, nil
+}
+
+// proxiedSSRFTransport enforces destination SSRF validation (including DNS resolution
+// when !allowLoopback) on every proxied request and redirect hop before forwarding to the proxy.
+type proxiedSSRFTransport struct {
+	base          *http.Transport
+	allowLoopback bool
+	lookupFn      lookupNetIPFunc
+}
+
+func (t *proxiedSSRFTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	if req == nil || req.URL == nil {
+		return nil, fmt.Errorf("%w: URL is required", ErrSSRFBlocked)
+	}
+	if err := validateOutboundRequestURL(req.Context(), req.URL, t.allowLoopback, true, t.lookupFn); err != nil {
+		if req.Body != nil {
+			_ = req.Body.Close()
+		}
+		return nil, err
+	}
+	return t.base.RoundTrip(req)
 }
 
 func newSSRFSafeDialContextWithLookup(

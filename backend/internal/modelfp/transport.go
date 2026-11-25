@@ -21,7 +21,8 @@ import (
 const (
 	defaultProbeTimeout       = 30 * time.Second
 	responsesProbeTimeout     = 60 * time.Second
-	maxProbeResponseBytes     = 256 << 10 // 256 KiB per response cap
+	maxResponseBodyBytes      = 256 << 10 // 256 KiB per response cap
+	maxDiscoverModelPages     = 10
 	maxErrorMessageChars      = 512
 	maxRedirects              = 5
 	defaultAnthropicVersion   = "2023-06-01"
@@ -80,17 +81,24 @@ func WithAllowLoopbackForTest() TransportOption {
 	}
 }
 
+func withLookupNetIPForTest(fn lookupNetIPFunc) TransportOption {
+	return func(c *HTTPProbeClient) {
+		c.lookupFn = fn
+	}
+}
+
 // HTTPProbeClient implements ProbeClient over SSRF-hardened HTTP transports.
 type HTTPProbeClient struct {
 	allowLoopback bool
+	lookupFn      lookupNetIPFunc
 	mu            sync.Mutex
-	transports    map[string]*http.Transport
+	transports    map[string]http.RoundTripper
 }
 
 // NewHTTPProbeClient creates a 4-protocol SSRF-safe HTTP ProbeClient.
 func NewHTTPProbeClient(opts ...TransportOption) *HTTPProbeClient {
 	c := &HTTPProbeClient{
-		transports: make(map[string]*http.Transport),
+		transports: make(map[string]http.RoundTripper),
 	}
 	for _, opt := range opts {
 		if opt != nil {
@@ -126,74 +134,85 @@ func NormalizeProtocolEndpoint(baseURL string, protocol Protocol, model string, 
 		return "", errors.New("model is required")
 	}
 
-	path := strings.TrimRight(parsed.Path, "/")
+	unescapedBase := strings.TrimRight(parsed.Path, "/")
+	escapedBase := strings.TrimRight(parsed.EscapedPath(), "/")
+
+	var unescapedPath, rawPath string
 	switch protocol {
 	case ProtocolOpenAIChat:
-		path = normalizeOpenAIStylePath(path, "/chat/completions", forDiscovery)
+		unescapedPath, rawPath = normalizeOpenAIStylePath(unescapedBase, escapedBase, "/chat/completions", forDiscovery)
 	case ProtocolOpenAIResponses:
-		path = normalizeOpenAIStylePath(path, "/responses", forDiscovery)
+		unescapedPath, rawPath = normalizeOpenAIStylePath(unescapedBase, escapedBase, "/responses", forDiscovery)
 	case ProtocolAnthropic:
-		path = normalizeOpenAIStylePath(path, "/messages", forDiscovery)
+		unescapedPath, rawPath = normalizeOpenAIStylePath(unescapedBase, escapedBase, "/messages", forDiscovery)
 	case ProtocolGemini:
-		path = normalizeGeminiPath(path, cleanModel, forDiscovery)
+		unescapedPath, rawPath = normalizeGeminiPath(unescapedBase, escapedBase, cleanModel, forDiscovery)
 	default:
 		return "", fmt.Errorf("unsupported protocol %q", protocol)
 	}
 
-	parsed.Path = path
-	parsed.RawPath = ""
+	parsed.Path = unescapedPath
+	if rawPath != unescapedPath {
+		parsed.RawPath = rawPath
+	} else {
+		parsed.RawPath = ""
+	}
 	parsed.Fragment = ""
 	return parsed.String(), nil
 }
 
-func normalizeOpenAIStylePath(path, endpointSuffix string, forDiscovery bool) string {
+func normalizeOpenAIStylePath(unescapedBase, escapedBase, endpointSuffix string, forDiscovery bool) (string, string) {
 	if forDiscovery {
 		for _, known := range []string{"/chat/completions", "/responses", "/messages"} {
-			path = strings.TrimSuffix(path, known)
+			unescapedBase = strings.TrimSuffix(unescapedBase, known)
+			escapedBase = strings.TrimSuffix(escapedBase, known)
 		}
-		if strings.HasSuffix(path, "/models") {
-			return path
+		if strings.HasSuffix(unescapedBase, "/models") {
+			return unescapedBase, escapedBase
 		}
-		if hasAPIVersionSuffix(path) {
-			return path + "/models"
+		if hasAPIVersionSuffix(unescapedBase) {
+			return unescapedBase + "/models", escapedBase + "/models"
 		}
-		return path + "/v1/models"
+		return unescapedBase + "/v1/models", escapedBase + "/v1/models"
 	}
 
-	if strings.HasSuffix(path, endpointSuffix) {
-		return path
+	if strings.HasSuffix(unescapedBase, endpointSuffix) {
+		return unescapedBase, escapedBase
 	}
-	if hasAPIVersionSuffix(path) {
-		return path + endpointSuffix
+	if hasAPIVersionSuffix(unescapedBase) {
+		return unescapedBase + endpointSuffix, escapedBase + endpointSuffix
 	}
-	return path + "/v1" + endpointSuffix
+	return unescapedBase + "/v1" + endpointSuffix, escapedBase + "/v1" + endpointSuffix
 }
 
-func normalizeGeminiPath(path, model string, forDiscovery bool) string {
+func normalizeGeminiPath(unescapedBase, escapedBase, model string, forDiscovery bool) (string, string) {
 	escapedModel := url.PathEscape(model)
 	if forDiscovery {
-		if idx := strings.Index(path, "/models/"); idx >= 0 {
-			path = path[:idx] + "/models"
+		if idx := strings.Index(unescapedBase, "/models/"); idx >= 0 {
+			unescapedBase = unescapedBase[:idx] + "/models"
 		}
-		if strings.HasSuffix(path, "/models") {
-			return path
+		if idx := strings.Index(escapedBase, "/models/"); idx >= 0 {
+			escapedBase = escapedBase[:idx] + "/models"
 		}
-		if hasAPIVersionSuffix(path) {
-			return path + "/models"
+		if strings.HasSuffix(unescapedBase, "/models") {
+			return unescapedBase, escapedBase
 		}
-		return path + "/v1beta/models"
+		if hasAPIVersionSuffix(unescapedBase) {
+			return unescapedBase + "/models", escapedBase + "/models"
+		}
+		return unescapedBase + "/v1beta/models", escapedBase + "/v1beta/models"
 	}
 
-	if strings.HasSuffix(path, ":generateContent") {
-		return path
+	if strings.HasSuffix(unescapedBase, ":generateContent") {
+		return unescapedBase, escapedBase
 	}
-	if strings.HasSuffix(path, "/models") {
-		return path + "/" + escapedModel + ":generateContent"
+	if strings.HasSuffix(unescapedBase, "/models") {
+		return unescapedBase + "/" + model + ":generateContent", escapedBase + "/" + escapedModel + ":generateContent"
 	}
-	if hasAPIVersionSuffix(path) {
-		return path + "/models/" + escapedModel + ":generateContent"
+	if hasAPIVersionSuffix(unescapedBase) {
+		return unescapedBase + "/models/" + model + ":generateContent", escapedBase + "/models/" + escapedModel + ":generateContent"
 	}
-	return path + "/v1beta/models/" + escapedModel + ":generateContent"
+	return unescapedBase + "/v1beta/models/" + model + ":generateContent", escapedBase + "/v1beta/models/" + escapedModel + ":generateContent"
 }
 
 func hasAPIVersionSuffix(path string) bool {
@@ -251,7 +270,7 @@ func (c *HTTPProbeClient) ExecuteProbe(
 		return res
 	}
 
-	if _, err := validateBaseURL(ctx, target.BaseURL, c.allowLoopback); err != nil {
+	if _, err := validateBaseURLWithLookup(ctx, target.BaseURL, c.allowLoopback, c.lookupFn); err != nil {
 		return finish(ProbeCallResult{
 			ErrorCode:    classifyTransportError(err),
 			ErrorMessage: err.Error(),
@@ -289,7 +308,7 @@ func (c *HTTPProbeClient) ExecuteProbe(
 		})
 	}
 
-	status, body, exceeded, reqErr := c.doJSONRequest(reqCtx, httpClient, http.MethodPost, endpoint, payload, target)
+	status, body, reqErr := c.doJSONRequest(reqCtx, httpClient, http.MethodPost, endpoint, payload, target)
 	if reqErr != nil {
 		return finish(ProbeCallResult{
 			HTTPStatus:   status,
@@ -310,7 +329,7 @@ func (c *HTTPProbeClient) ExecuteProbe(
 				ErrorMessage: fbErr.Error(),
 			})
 		}
-		status, body, exceeded, reqErr = c.doJSONRequest(reqCtx, httpClient, http.MethodPost, endpoint, fallbackPayload, target)
+		status, body, reqErr = c.doJSONRequest(reqCtx, httpClient, http.MethodPost, endpoint, fallbackPayload, target)
 		if reqErr != nil {
 			return finish(ProbeCallResult{
 				HTTPStatus:   status,
@@ -325,14 +344,6 @@ func (c *HTTPProbeClient) ExecuteProbe(
 			HTTPStatus:   status,
 			ErrorCode:    classifyHTTPStatus(status),
 			ErrorMessage: extractErrorMessage(status, body),
-		})
-	}
-
-	if exceeded {
-		return finish(ProbeCallResult{
-			HTTPStatus:   status,
-			ErrorCode:    errorCodeUpstreamError,
-			ErrorMessage: "upstream response exceeded 256 KB limit",
 		})
 	}
 
@@ -352,13 +363,14 @@ func (c *HTTPProbeClient) ExecuteProbe(
 	return finish(parsed)
 }
 
-// DiscoverModels queries the protocol's model listing endpoint and returns deduplicated model IDs.
+// DiscoverModels queries the protocol's model listing endpoint (following pagination cursors
+// up to maxDiscoverModelPages) and returns deduplicated model IDs.
 func (c *HTTPProbeClient) DiscoverModels(ctx context.Context, target ProbeTarget) ([]string, error) {
-	if _, err := validateBaseURL(ctx, target.BaseURL, c.allowLoopback); err != nil {
+	if _, err := validateBaseURLWithLookup(ctx, target.BaseURL, c.allowLoopback, c.lookupFn); err != nil {
 		return nil, redactError(err, target)
 	}
 
-	endpoint, err := NormalizeProtocolEndpoint(target.BaseURL, target.Protocol, "", true)
+	baseEndpoint, err := NormalizeProtocolEndpoint(target.BaseURL, target.Protocol, "", true)
 	if err != nil {
 		return nil, redactError(err, target)
 	}
@@ -371,55 +383,124 @@ func (c *HTTPProbeClient) DiscoverModels(ctx context.Context, target ProbeTarget
 	reqCtx, cancel := context.WithTimeout(ctx, defaultProbeTimeout)
 	defer cancel()
 
-	status, body, exceeded, reqErr := c.doJSONRequest(reqCtx, httpClient, http.MethodGet, endpoint, nil, target)
-	if reqErr != nil {
-		return nil, redactError(reqErr, target)
-	}
-	if status < http.StatusOK || status >= http.StatusMultipleChoices {
-		msg := redactSecrets(extractErrorMessage(status, body), target)
-		return nil, fmt.Errorf("%s: %s", classifyHTTPStatus(status), msg)
-	}
-	if exceeded {
-		return nil, errors.New("discover models response exceeded 256 KB limit")
+	seenModels := make(map[string]struct{})
+	seenCursors := make(map[string]struct{})
+	var allModels []string
+	nextURL := baseEndpoint
+
+	for page := 0; page < maxDiscoverModelPages; page++ {
+		status, body, reqErr := c.doJSONRequest(reqCtx, httpClient, http.MethodGet, nextURL, nil, target)
+		if reqErr != nil {
+			return nil, redactError(reqErr, target)
+		}
+		if status < http.StatusOK || status >= http.StatusMultipleChoices {
+			msg := redactSecrets(extractErrorMessage(status, body), target)
+			return nil, fmt.Errorf("%s: %s", classifyHTTPStatus(status), msg)
+		}
+
+		pageModels, cursorParam, cursorVal, parseErr := parseDiscoverModelsPage(target.Protocol, body)
+		if parseErr != nil {
+			return nil, redactError(parseErr, target)
+		}
+		for _, id := range pageModels {
+			if _, exists := seenModels[id]; exists {
+				continue
+			}
+			seenModels[id] = struct{}{}
+			allModels = append(allModels, id)
+		}
+
+		if cursorParam == "" || cursorVal == "" {
+			break
+		}
+		cursorKey := cursorParam + "=" + cursorVal
+		if _, repeated := seenCursors[cursorKey]; repeated {
+			break
+		}
+		seenCursors[cursorKey] = struct{}{}
+
+		pagedURL, err := withQueryParam(baseEndpoint, cursorParam, cursorVal)
+		if err != nil {
+			return nil, redactError(err, target)
+		}
+		nextURL = pagedURL
 	}
 
-	models, err := parseDiscoverModelsResponse(target.Protocol, body)
+	return allModels, nil
+}
+
+func withQueryParam(rawURL, key, value string) (string, error) {
+	u, err := url.Parse(rawURL)
 	if err != nil {
-		return nil, redactError(err, target)
+		return "", err
 	}
-	return models, nil
+	q := u.Query()
+	q.Set(key, value)
+	u.RawQuery = q.Encode()
+	return u.String(), nil
 }
 
 func (c *HTTPProbeClient) clientForTarget(target ProbeTarget, timeout time.Duration) (*http.Client, error) {
 	key := fmt.Sprintf("%t|%s", c.allowLoopback, strings.TrimSpace(target.ProxyURL))
 	c.mu.Lock()
-	tr, ok := c.transports[key]
+	rt, ok := c.transports[key]
 	if !ok {
 		var err error
-		tr, err = newSSRFSafeTransport(target.ProxyURL, c.allowLoopback)
+		rt, err = newSSRFSafeTransportWithLookup(target.ProxyURL, c.allowLoopback, c.lookupFn)
 		if err != nil {
 			c.mu.Unlock()
 			return nil, err
 		}
-		c.transports[key] = tr
+		c.transports[key] = rt
 	}
 	c.mu.Unlock()
 
 	allowLoopback := c.allowLoopback
+	lookupFn := c.lookupFn
+	failClosedOnDNS := strings.TrimSpace(target.ProxyURL) != ""
+
 	return &http.Client{
-		Transport: tr,
+		Transport: rt,
 		Timeout:   timeout,
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
 			if len(via) >= maxRedirects {
 				return fmt.Errorf("%w: stopped after %d redirects", ErrSSRFBlocked, maxRedirects)
 			}
-			if req == nil || req.URL == nil {
+			if req == nil || req.URL == nil || len(via) == 0 || via[0].URL == nil {
 				return fmt.Errorf("%w: redirect missing URL", ErrSSRFBlocked)
 			}
-			_, err := validateBaseURL(req.Context(), req.URL.String(), allowLoopback)
-			return err
+			if !sameOrigin(via[0].URL, req.URL) {
+				return fmt.Errorf("%w: cross-origin redirect is blocked", ErrSSRFBlocked)
+			}
+			return validateOutboundRequestURL(req.Context(), req.URL, allowLoopback, failClosedOnDNS, lookupFn)
 		},
 	}, nil
+}
+
+func sameOrigin(a, b *url.URL) bool {
+	if a == nil || b == nil {
+		return false
+	}
+	if !strings.EqualFold(a.Scheme, b.Scheme) {
+		return false
+	}
+	if normalizeHost(a.Hostname()) != normalizeHost(b.Hostname()) {
+		return false
+	}
+	return effectivePort(a) == effectivePort(b)
+}
+
+func effectivePort(u *url.URL) string {
+	if p := u.Port(); p != "" {
+		return p
+	}
+	if strings.EqualFold(u.Scheme, "https") {
+		return "443"
+	}
+	if strings.EqualFold(u.Scheme, "http") {
+		return "80"
+	}
+	return ""
 }
 
 func (c *HTTPProbeClient) doJSONRequest(
@@ -429,7 +510,7 @@ func (c *HTTPProbeClient) doJSONRequest(
 	endpoint string,
 	payload []byte,
 	target ProbeTarget,
-) (status int, body []byte, exceeded bool, err error) {
+) (status int, body []byte, err error) {
 	var bodyReader io.Reader
 	if payload != nil {
 		bodyReader = bytes.NewReader(payload)
@@ -437,24 +518,21 @@ func (c *HTTPProbeClient) doJSONRequest(
 
 	req, err := http.NewRequestWithContext(ctx, method, endpoint, bodyReader)
 	if err != nil {
-		return 0, nil, false, err
+		return 0, nil, err
 	}
 	applyProtocolHeaders(req, target, payload != nil)
 
-	resp, err := client.Do(req) //nolint:gosec // G704: URL validated by validateBaseURL and transport enforces SSRF DialContext & CheckRedirect
+	resp, err := client.Do(req) //nolint:gosec // G704: URL validated by validateBaseURLWithLookup; transport enforces SSRF DialContext/RoundTrip & same-origin CheckRedirect
 	if err != nil {
-		return 0, nil, false, err
+		return 0, nil, err
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	raw, readErr := io.ReadAll(io.LimitReader(resp.Body, maxProbeResponseBytes+1))
+	raw, readErr := io.ReadAll(io.LimitReader(resp.Body, maxResponseBodyBytes))
 	if readErr != nil {
-		return resp.StatusCode, nil, false, readErr
+		return resp.StatusCode, nil, readErr
 	}
-	if int64(len(raw)) > maxProbeResponseBytes {
-		return resp.StatusCode, raw[:maxProbeResponseBytes], true, nil
-	}
-	return resp.StatusCode, raw, false, nil
+	return resp.StatusCode, raw, nil
 }
 
 func applyProtocolHeaders(req *http.Request, target ProbeTarget, hasBody bool) {
@@ -873,8 +951,8 @@ func parseAnthropicResponse(body []byte) (ProbeCallResult, error) {
 		}
 	}
 
-	promptTokens := resp.Usage.InputTokens + resp.Usage.CacheCreationInputTokens
 	cachedTokens := maxInt(resp.Usage.CacheReadInputTokens, resp.Usage.CachedTokens)
+	promptTokens := resp.Usage.InputTokens + resp.Usage.CacheCreationInputTokens + cachedTokens
 
 	return ProbeCallResult{
 		Text:               sb.String(),
@@ -980,7 +1058,7 @@ func parseGeminiResponse(body []byte) (ProbeCallResult, error) {
 	return res, nil
 }
 
-func parseDiscoverModelsResponse(protocol Protocol, body []byte) ([]string, error) {
+func parseDiscoverModelsPage(protocol Protocol, body []byte) (models []string, cursorParam string, cursorVal string, err error) {
 	var payload struct {
 		Data []struct {
 			ID string `json:"id"`
@@ -990,9 +1068,12 @@ func parseDiscoverModelsResponse(protocol Protocol, body []byte) ([]string, erro
 			Name                       string   `json:"name"`
 			SupportedGenerationMethods []string `json:"supportedGenerationMethods"`
 		} `json:"models"`
+		NextPageToken string `json:"nextPageToken"`
+		HasMore       bool   `json:"has_more"`
+		LastID        string `json:"last_id"`
 	}
 	if err := json.Unmarshal(body, &payload); err != nil {
-		return nil, fmt.Errorf("decode models list: %w", err)
+		return nil, "", "", fmt.Errorf("decode models list: %w", err)
 	}
 
 	seen := make(map[string]struct{})
@@ -1024,7 +1105,10 @@ func parseDiscoverModelsResponse(protocol Protocol, body []byte) ([]string, erro
 		for _, item := range payload.Data {
 			addModel(strings.TrimPrefix(strings.TrimSpace(item.ID), "models/"))
 		}
-		return out, nil
+		if token := strings.TrimSpace(payload.NextPageToken); token != "" {
+			return out, "pageToken", token, nil
+		}
+		return out, "", "", nil
 	}
 
 	for _, item := range payload.Data {
@@ -1037,7 +1121,12 @@ func parseDiscoverModelsResponse(protocol Protocol, body []byte) ([]string, erro
 			addModel(m.Name)
 		}
 	}
-	return out, nil
+	if protocol == ProtocolAnthropic && payload.HasMore {
+		if lastID := strings.TrimSpace(payload.LastID); lastID != "" {
+			return out, "after_id", lastID, nil
+		}
+	}
+	return out, "", "", nil
 }
 
 func containsString(items []string, target string) bool {
@@ -1134,12 +1223,11 @@ func extractErrorMessage(status int, body []byte) string {
 				return envelope.Detail
 			}
 		}
-		return string(trimmed)
 	}
 	if text := http.StatusText(status); text != "" {
-		return fmt.Sprintf("HTTP %d %s", status, text)
+		return fmt.Sprintf("upstream HTTP %d %s", status, text)
 	}
-	return fmt.Sprintf("HTTP %d", status)
+	return fmt.Sprintf("upstream HTTP %d", status)
 }
 
 func redactError(err error, target ProbeTarget) error {
@@ -1182,7 +1270,7 @@ func redactSecrets(msg string, target ProbeTarget) string {
 func collectSecrets(target ProbeTarget) []string {
 	seen := make(map[string]struct{})
 	var secrets []string
-	add := func(s string) {
+	addVariant := func(s string) {
 		if s == "" {
 			return
 		}
@@ -1192,19 +1280,37 @@ func collectSecrets(target ProbeTarget) []string {
 		seen[s] = struct{}{}
 		secrets = append(secrets, s)
 	}
+	addWithEncodings := func(s string) {
+		if s == "" {
+			return
+		}
+		addVariant(s)
+		trimmed := strings.TrimSpace(s)
+		addVariant(trimmed)
+		if len(trimmed) >= 4 {
+			addVariant(url.QueryEscape(trimmed))
+		}
+		if rawJSON, err := json.Marshal(trimmed); err == nil && len(rawJSON) >= 2 {
+			addVariant(string(rawJSON[1 : len(rawJSON)-1]))
+		}
+		var buf bytes.Buffer
+		enc := json.NewEncoder(&buf)
+		enc.SetEscapeHTML(false)
+		if err := enc.Encode(trimmed); err == nil {
+			escaped := strings.TrimSpace(buf.String())
+			if len(escaped) >= 2 {
+				addVariant(escaped[1 : len(escaped)-1])
+			}
+		}
+	}
 
 	if target.APIKey != "" {
-		add(target.APIKey)
-		trimmed := strings.TrimSpace(target.APIKey)
-		add(trimmed)
-		if len(trimmed) >= 4 {
-			add(url.QueryEscape(trimmed))
-		}
+		addWithEncodings(target.APIKey)
 	}
 	if target.ProxyURL != "" {
 		if parsed, err := url.Parse(strings.TrimSpace(target.ProxyURL)); err == nil && parsed.User != nil {
 			if pw, ok := parsed.User.Password(); ok {
-				add(pw)
+				addWithEncodings(pw)
 			}
 		}
 	}
@@ -1216,9 +1322,8 @@ func collectSecrets(target ProbeTarget) []string {
 			strings.Contains(lower, "secret") ||
 			strings.Contains(lower, "cookie") ||
 			strings.Contains(lower, "pass") {
-			trimmed := strings.TrimSpace(v)
-			if len(trimmed) >= 4 {
-				add(trimmed)
+			if len(strings.TrimSpace(v)) >= 4 {
+				addWithEncodings(v)
 			}
 		}
 	}
