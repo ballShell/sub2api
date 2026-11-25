@@ -1,0 +1,115 @@
+[
+  {
+    "suite_key": "builtin-public",
+    "version": "v1",
+    "name": "Builtin Public Probe Suite v1",
+    "visibility": "public",
+    "status": "active",
+    "is_default": true,
+    "probes": [
+      {
+        "id": "lp-prose-1",
+        "kind": "logprobs",
+        "prompt": "Continue directly with the next word only: The quiet coastal town woke up to a pale",
+        "max_tokens": 1,
+        "temperature": 0,
+        "top_logprobs": 20,
+        "seed": 42,
+        "weight": 1.0,
+        "expected_max_prompt_tokens": 500,
+        "description": "Short narrative continuation prior over common descriptive tokens"
+      },
+      {
+        "id": "lp-json-2",
+        "kind": "logprobs",
+        "prompt": "Output only the next token in this JSON snippet without markdown: {\"status\": \"",
+        "max_tokens": 1,
+        "temperature": 0,
+        "top_logprobs": 20,
+        "seed": 42,
+        "weight": 1.0,
+        "expected_max_prompt_tokens": 500,
+        "description": "Structured JSON status token prior"
+      },
+      {
+        "id": "lp-code-3",
+        "kind": "logprobs",
+        "prompt": "Complete the Python function signature with the next token only: def normalize_scores(values: list[float]) ->",
+        "max_tokens": 1,
+        "temperature": 0,
+        "top_logprobs": 20,
+        "seed": 42,
+        "weight": 1.0,
+        "expected_max_prompt_tokens": 500,
+        "description": "Python return type annotation token prior"
+      },
+      {
+        "id": "lp-digit-4",
+        "kind": "logprobs",
+        "prompt": "Choose a single integer from 1 to 9 that comes to mind first and output only that digit:",
+        "max_tokens": 1,
+        "temperature": 0,
+        "top_logprobs": 20,
+        "seed": 42,
+        "weight": 1.0,
+        "expected_max_prompt_tokens": 500,
+        "description": "Single-digit choice distribution prior across model families"
+      },
+      {
+        "id": "bh-json-1",
+        "kind": "behavior",
+        "prompt": "Return strictly a single-line JSON object with keys \"sum\", \"sorted\", and \"parity\" for the integer list [14, 3, 9, 22, 7], where \"sorted\" is ascending and \"parity\" is \"even\" or \"odd\" for the sum. Output JSON only, no markdown.",
+        "max_tokens": 64,
+        "temperature": 0,
+        "weight": 1.0,
+        "expected_max_prompt_tokens": 500,
+        "expected_format": "json",
+        "description": "Deterministic structured JSON formatting and arithmetic compliance"
+      },
+      {
+        "id": "bh-transform-2",
+        "kind": "behavior",
+        "prompt": "Reverse each word's characters in \"alpha beta gamma delta\" while keeping word order, then join with commas and no spaces. Output the resulting string only.",
+        "max_tokens": 64,
+        "temperature": 0,
+        "weight": 1.0,
+        "expected_max_prompt_tokens": 500,
+        "expected_format": "csv",
+        "description": "Character-level reversal and delimiter adherence"
+      },
+      {
+        "id": "bh-lines-3",
+        "kind": "behavior",
+        "prompt": "Write exactly three short lines describing a prism splitting white light: line 1 starts with \"1:\", line 2 starts with \"2:\", line 3 starts with \"3:\". Keep each line under 8 words.",
+        "max_tokens": 64,
+        "temperature": 0,
+        "weight": 1.0,
+        "expected_max_prompt_tokens": 500,
+        "expected_format": "numbered_lines",
+        "description": "Constrained stylistic phrasing and line-count adherence"
+      },
+      {
+        "id": "bh-code-4",
+        "kind": "behavior",
+        "prompt": "Write a minimal single-function Python snippet named dedupe_keep_order(items) using only built-in types, with no comments, no docstrings, and no example calls.",
+        "max_tokens": 64,
+        "temperature": 0,
+        "weight": 1.0,
+        "expected_max_prompt_tokens": 500,
+        "expected_format": "code",
+        "description": "Idiomatic code synthesis style and negative constraint obedience"
+      },
+      {
+        "id": "bh-count-5",
+        "kind": "behavior",
+        "prompt": "Count the occurrences of the letter 'r' (case-insensitive) in the string \"strawberry-harbor-mirror\". Output a single integer only.",
+        "max_tokens": 64,
+        "temperature": 0,
+        "weight": 1.0,
+        "expected_max_prompt_tokens": 500,
+        "expected_format": "integer",
+        "description": "Subword character-counting sensitivity and output conciseness"
+      }
+    ]
+  }
+]
