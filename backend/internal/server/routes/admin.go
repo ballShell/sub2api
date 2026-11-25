@@ -127,6 +127,9 @@ func RegisterAdminRoutes(
 		// 独立提示词输入审计
 		registerPromptAuditRoutes(admin, h)
 
+		// 模型指纹识别
+		registerModelFingerprintRoutes(admin, h)
+
 		// 邀请返利（专属用户管理）
 		registerAffiliateRoutes(admin, h)
 
@@ -148,6 +151,35 @@ func registerPromptAuditRoutes(admin *gin.RouterGroup, h *handler.Handlers) {
 		promptAudit.POST("/events/batch-delete", h.Admin.PromptAudit.BatchDelete)
 		promptAudit.POST("/events/delete-preview", h.Admin.PromptAudit.DeletePreview)
 		promptAudit.POST("/events/delete-by-filter", h.Admin.PromptAudit.DeleteByFilter)
+	}
+}
+
+func registerModelFingerprintRoutes(admin *gin.RouterGroup, h *handler.Handlers) {
+	fp := admin.Group("/model-fingerprint")
+	{
+		fp.POST("/discover-models", h.Admin.ModelFP.DiscoverModels)
+		fp.POST("/runs", h.Admin.ModelFP.CreateRun)
+		fp.GET("/runs", h.Admin.ModelFP.ListRuns)
+		fp.GET("/runs/:id", h.Admin.ModelFP.GetRun)
+		fp.POST("/runs/:id/cancel", h.Admin.ModelFP.CancelRun)
+		fp.DELETE("/runs/:id", h.Admin.ModelFP.DeleteRun)
+
+		fp.GET("/baselines", h.Admin.ModelFP.ListBaselines)
+		fp.POST("/baselines/capture", h.Admin.ModelFP.StartCapture)
+		fp.GET("/baselines/capture/:job_id", h.Admin.ModelFP.GetCaptureJob)
+		fp.POST("/baselines/confusion-matrix", h.Admin.ModelFP.ConfusionMatrix)
+		fp.GET("/baselines/export", h.Admin.ModelFP.ExportBaselines)
+		fp.POST("/baselines/import", h.Admin.ModelFP.ImportBaselines)
+		fp.PUT("/baselines/:id", h.Admin.ModelFP.UpdateBaseline)
+		fp.DELETE("/baselines/:id", h.Admin.ModelFP.DeleteBaseline)
+
+		fp.GET("/suites", h.Admin.ModelFP.ListSuites)
+		fp.POST("/suites", h.Admin.ModelFP.CreateSuite)
+		fp.PUT("/suites/:id/status", h.Admin.ModelFP.UpdateSuiteStatus)
+
+		fp.GET("/families", h.Admin.ModelFP.ListFamilyMaps)
+		fp.PUT("/families/:canonical_model", h.Admin.ModelFP.UpsertFamilyMap)
+		fp.DELETE("/families/:canonical_model", h.Admin.ModelFP.DeleteFamilyMap)
 	}
 }
 

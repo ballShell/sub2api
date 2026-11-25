@@ -13,6 +13,7 @@ import (
 	"github.com/Wei-Shaw/sub2api/ent"
 	"github.com/Wei-Shaw/sub2api/internal/config"
 	"github.com/Wei-Shaw/sub2api/internal/handler"
+	"github.com/Wei-Shaw/sub2api/internal/modelfp"
 	"github.com/Wei-Shaw/sub2api/internal/payment"
 	"github.com/Wei-Shaw/sub2api/internal/repository"
 	"github.com/Wei-Shaw/sub2api/internal/securityaudit"
@@ -27,6 +28,7 @@ import (
 type Application struct {
 	Server        *http.Server
 	PromptAudit   *securityaudit.PromptService
+	ModelFP       *modelfp.Service
 	PluginManager *service.PluginManager
 	Cleanup       func()
 }
@@ -40,6 +42,7 @@ func initializeApplication(buildInfo handler.BuildInfo) (*Application, error) {
 		repository.ProviderSet,
 		service.ProviderSet,
 		securityaudit.ProviderSet,
+		modelfp.ProviderSet,
 		payment.ProviderSet,
 		middleware.ProviderSet,
 		handler.ProviderSet,
@@ -58,7 +61,7 @@ func initializeApplication(buildInfo handler.BuildInfo) (*Application, error) {
 		provideCleanup,
 
 		// Application struct
-		wire.Struct(new(Application), "Server", "PromptAudit", "PluginManager", "Cleanup"),
+		wire.Struct(new(Application), "Server", "PromptAudit", "ModelFP", "PluginManager", "Cleanup"),
 	)
 	return nil, nil
 }
@@ -133,6 +136,7 @@ func provideCleanup(
 	auditLog *service.AuditLogService,
 	openAIAutoReset *service.OpenAIQuotaAutoResetService,
 	promptAudit *securityaudit.PromptService,
+	modelFP *modelfp.Service,
 	pluginManager *service.PluginManager,
 ) func() {
 	return func() {
@@ -197,6 +201,12 @@ func provideCleanup(
 			{"PromptAuditService", func() error {
 				if promptAudit != nil {
 					return promptAudit.Shutdown(ctx)
+				}
+				return nil
+			}},
+			{"ModelFPService", func() error {
+				if modelFP != nil {
+					return modelFP.Stop()
 				}
 				return nil
 			}},

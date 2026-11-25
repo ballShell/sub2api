@@ -224,3 +224,66 @@ func TestAuditRecordsEveryMCPOAuthReadWithGrant(t *testing.T) {
 	require.Equal(t, "grant-1", logs[0].Extra["mcp_grant_id"])
 	require.Equal(t, "admin_list_users", logs[0].Extra["mcp_tool"])
 }
+
+func TestAuditLogOmitsModelFPBodies(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	expected := map[string]string{
+		"POST /api/v1/admin/model-fingerprint/discover-models":   "admin.model_fingerprint.models.discover",
+		"POST /api/v1/admin/model-fingerprint/runs":              "admin.model_fingerprint.run.create",
+		"POST /api/v1/admin/model-fingerprint/baselines/capture": "admin.model_fingerprint.baselines.capture",
+		"POST /api/v1/admin/model-fingerprint/baselines/import":  "admin.model_fingerprint.baselines.import",
+		"POST /api/v1/admin/model-fingerprint/suites":            "admin.model_fingerprint.suite.create",
+	}
+
+	for route, wantAction := range expected {
+		_, omitted := auditBodyOmittedRoutes[route]
+		require.Truef(t, omitted, "%s must be in auditBodyOmittedRoutes", route)
+		require.Equal(t, wantAction, auditActionOverrides[route])
+	}
+
+	repository := &auditCaptureRepository{}
+	auditService := service.NewAuditLogService(repository, nil)
+	auditService.Start()
+
+	router := gin.New()
+	router.Use(func(c *gin.Context) {
+		c.Set(string(ContextKeyUser), AuthSubject{UserID: 77})
+		c.Set(string(ContextKeyUserRole), service.RoleAdmin)
+		c.Next()
+	})
+	router.Use(gin.HandlerFunc(NewAuditLogMiddleware(auditService)))
+
+	okHandler := func(c *gin.Context) { c.JSON(http.StatusOK, gin.H{"ok": true}) }
+	router.POST("/api/v1/admin/model-fingerprint/discover-models", okHandler)
+	router.POST("/api/v1/admin/model-fingerprint/runs", okHandler)
+	router.POST("/api/v1/admin/model-fingerprint/baselines/capture", okHandler)
+	router.POST("/api/v1/admin/model-fingerprint/baselines/import", okHandler)
+	router.POST("/api/v1/admin/model-fingerprint/suites", okHandler)
+
+	const secretCanary = "modelfp-audit-secret-canary-777"
+	for _, path := range []string{
+		"/api/v1/admin/model-fingerprint/discover-models",
+		"/api/v1/admin/model-fingerprint/runs",
+		"/api/v1/admin/model-fingerprint/baselines/capture",
+		"/api/v1/admin/model-fingerprint/baselines/import",
+		"/api/v1/admin/model-fingerprint/suites",
+	} {
+		req := httptest.NewRequest(http.MethodPost, path, bytes.NewBufferString(`{"api_key":"`+secretCanary+`","prompt":"`+secretCanary+`"}`))
+		req.Header.Set("Content-Type", "application/json")
+		rec := httptest.NewRecorder()
+		router.ServeHTTP(rec, req)
+		require.Equal(t, http.StatusOK, rec.Code)
+	}
+	auditService.Stop()
+
+	repository.mu.Lock()
+	logs := append([]*service.AuditLog(nil), repository.logs...)
+	repository.mu.Unlock()
+	require.Len(t, logs, 5)
+
+	for _, entry := range logs {
+		require.Equal(t, "<credential-bearing body omitted>", entry.RequestBody)
+		require.NotContains(t, entry.RequestBody, secretCanary)
+	}
+}
