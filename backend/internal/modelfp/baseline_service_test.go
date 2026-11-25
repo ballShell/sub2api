@@ -968,3 +968,423 @@ func TestBaselineSecretSanitizationOnCaptureError(t *testing.T) {
 	require.NotContains(t, done.Results[0].Error, secret)
 	require.True(t, strings.Contains(done.Results[0].Error, "auth_error") || strings.Contains(done.Results[0].Error, "unauthorized"))
 }
+
+func TestCaptureRejectsKeyInModelNameAndRedactsEchoedSignatures(t *testing.T) {
+	ctx := context.Background()
+	apiKey := "opaque-adhoc-secret-9988"
+
+	client := &mockProbeClient{
+		handler: func(_ context.Context, _ ProbeTarget, _ string, probe ProbeDefinition, _ bool, _ int) ProbeCallResult {
+			if probe.Kind == DetectorLogprobs {
+				return ProbeCallResult{
+					Logprobs: []TokenProb{
+						{Token: "tok-" + apiKey, Prob: 0.70},
+						{Token: " safe", Prob: 0.25},
+					},
+					LogprobsSupported: true,
+					HTTPStatus:        200,
+				}
+			}
+			return ProbeCallResult{
+				Text:              "echo:" + apiKey + "\nline2",
+				ResponseModel:     "gpt-4o-" + apiKey,
+				SystemFingerprint: "fp-" + apiKey,
+				HTTPStatus:        200,
+			}
+		},
+	}
+
+	svc, store := newTestBaselineServiceEnv(t, client, nil, nil, nil)
+	suite := seedMinimalSuite(t, store)
+
+	// 1. Model name containing ad-hoc API key is rejected before persisting any CaptureJob.
+	_, err := svc.StartCaptureJob(ctx, CaptureRequest{
+		TargetSource: TargetSourceAdHoc,
+		Protocol:     ProtocolOpenAIChat,
+		BaseURL:      "https://api.example.com/v1",
+		APIKey:       apiKey,
+		SuiteID:      suite.ID,
+		Models:       []string{"gpt-4o-" + apiKey},
+	}, 1)
+	require.Error(t, err)
+	require.Equal(t, 400, infraerrors.Code(err))
+
+	// 2. Echoed api_key in logprob tokens, behavior text, response_model, system_fingerprint, and snapshot
+	// must never reach stored baselines, CaptureJob results_json, or exported bundles.
+	job, err := svc.StartCaptureJob(ctx, CaptureRequest{
+		TargetSource:     TargetSourceAdHoc,
+		Protocol:         ProtocolOpenAIChat,
+		BaseURL:          "https://api.example.com/v1",
+		APIKey:           apiKey,
+		SuiteID:          suite.ID,
+		Models:           []string{"gpt-4o"},
+		UpstreamSnapshot: "snap-" + apiKey,
+		Notes:            "note-" + apiKey,
+	}, 1)
+	require.NoError(t, err)
+
+	done := waitForCaptureJobTerminal(t, svc, job.ID)
+	require.Equal(t, RunStatusCompleted, done.Status)
+	require.Len(t, done.Results, 1)
+	require.NotNil(t, done.Results[0].LogprobsBaselineID)
+	require.NotNil(t, done.Results[0].BehaviorBaselineID)
+
+	rawJob, err := json.Marshal(done)
+	require.NoError(t, err)
+	require.NotContains(t, string(rawJob), apiKey)
+
+	lpBase, err := store.GetBaseline(ctx, *done.Results[0].LogprobsBaselineID)
+	require.NoError(t, err)
+	rawLP, err := json.Marshal(lpBase)
+	require.NoError(t, err)
+	require.NotContains(t, string(rawLP), apiKey)
+	require.Contains(t, string(rawLP), redactedSecretPlaceholder)
+
+	bhBase, err := store.GetBaseline(ctx, *done.Results[0].BehaviorBaselineID)
+	require.NoError(t, err)
+	rawBH, err := json.Marshal(bhBase)
+	require.NoError(t, err)
+	require.NotContains(t, string(rawBH), apiKey)
+	require.Contains(t, string(rawBH), redactedSecretPlaceholder)
+
+	bundle, err := svc.ExportBundle(ctx, true)
+	require.NoError(t, err)
+	rawBundle, err := json.Marshal(bundle)
+	require.NoError(t, err)
+	require.NotContains(t, string(rawBundle), apiKey)
+}
+
+func TestCaptureRequiresBehaviorProbeAndFailsOnPartialPersistence(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("rejects_logprobs_only_suite", func(t *testing.T) {
+		svc, _ := newTestBaselineServiceEnv(t, nil, nil, nil, nil)
+		lpOnly, err := svc.CreateSuite(ctx, CreateSuiteRequest{
+			SuiteKey: "lp-only",
+			Version:  "v1",
+			Name:     "Logprobs Only",
+			Probes: []ProbeDefinition{
+				{ID: "lp-1", Kind: DetectorLogprobs, Prompt: "Hello", MaxTokens: 1, TopLogprobs: 20},
+			},
+		}, 1)
+		require.NoError(t, err)
+
+		_, err = svc.StartCaptureJob(ctx, CaptureRequest{
+			TargetSource: TargetSourceAdHoc,
+			Protocol:     ProtocolOpenAIChat,
+			BaseURL:      "https://api.example.com/v1",
+			APIKey:       "sk-test-lp-only-1234",
+			SuiteID:      lpOnly.ID,
+			Models:       []string{"gpt-4o"},
+		}, 1)
+		require.Error(t, err)
+		require.Equal(t, 400, infraerrors.Code(err))
+		require.Equal(t, "MODELFP_NO_APPLICABLE_PROBES", infraerrors.Reason(err))
+	})
+
+	t.Run("behavior_write_failure_after_logprobs_marks_model_and_job_failed", func(t *testing.T) {
+		baseStore := NewMemoryStore()
+		failingStore := &failOnBaselineWriteStore{
+			MemoryStore: baseStore,
+			failKind:    DetectorBehavior,
+			failErr:     errors.New("simulated behavior write failure"),
+		}
+		client := &mockProbeClient{
+			handler: func(_ context.Context, _ ProbeTarget, _ string, probe ProbeDefinition, _ bool, _ int) ProbeCallResult {
+				if probe.Kind == DetectorLogprobs {
+					return ProbeCallResult{
+						Logprobs:          []TokenProb{{Token: " sky", Prob: 0.9}},
+						LogprobsSupported: true,
+						HTTPStatus:        200,
+					}
+				}
+				return ProbeCallResult{Text: `{"sum":55}`, HTTPStatus: 200}
+			},
+		}
+		resolver := NewTargetResolverWithOptions(
+			&stubAccountLookup{},
+			&stubProxyLookup{},
+			withResolverLookupNetIPForTest(func(_ context.Context, _, _ string) ([]netip.Addr, error) {
+				return []netip.Addr{netip.MustParseAddr("93.184.216.34")}, nil
+			}),
+		)
+		svc := NewBaselineService(failingStore, resolver, NewOrchestrator(client))
+		t.Cleanup(svc.Stop)
+
+		suite, err := baseStore.UpsertSeedSuite(ctx, makeTestSuite())
+		require.NoError(t, err)
+
+		job, err := svc.StartCaptureJob(ctx, CaptureRequest{
+			TargetSource: TargetSourceAdHoc,
+			Protocol:     ProtocolOpenAIChat,
+			BaseURL:      "https://api.example.com/v1",
+			APIKey:       "sk-partial-fail-12345",
+			SuiteID:      suite.ID,
+			Models:       []string{"gpt-4o"},
+		}, 1)
+		require.NoError(t, err)
+
+		done := waitForCaptureJobTerminal(t, svc, job.ID)
+		require.Equal(t, RunStatusFailed, done.Status)
+		require.Len(t, done.Results, 1)
+		require.Contains(t, done.Results[0].Error, "simulated behavior write failure")
+		require.Nil(t, done.Results[0].BehaviorBaselineID)
+	})
+}
+
+func TestOverlapWarningUsesCandidateSelfDivStrictly(t *testing.T) {
+	ctx := context.Background()
+	client := &mockProbeClient{
+		handler: func(_ context.Context, _ ProbeTarget, _ string, probe ProbeDefinition, _ bool, _ int) ProbeCallResult {
+			if probe.Kind == DetectorLogprobs {
+				return ProbeCallResult{
+					// Deterministic across rounds -> candidate D_self == 0 (1.5 * D_self == 0).
+					Logprobs:          []TokenProb{{Token: " sky", Prob: 0.70}, {Token: " mist", Prob: 0.25}},
+					LogprobsSupported: true,
+					HTTPStatus:        200,
+				}
+			}
+			if probe.ID == "bh-1" {
+				return ProbeCallResult{Text: `{"sum":55}`, ResponseModel: "gpt-4o", HTTPStatus: 200}
+			}
+			return ProbeCallResult{Text: "7", ResponseModel: "gpt-4o", HTTPStatus: 200}
+		},
+	}
+
+	svc, store := newTestBaselineServiceEnv(t, client, nil, nil, nil)
+	suite := seedMinimalSuite(t, store)
+
+	// Peer has large SelfDivergenceP95 (0.50 -> 1.5*peer.D_self = 0.75) and small non-zero distance (~0.10),
+	// while candidate has D_self = 0 (D_near > 1.5 * candidate.D_self). OverlapWarning must remain false.
+	_, err := store.UpsertActiveBaseline(ctx, Baseline{
+		CanonicalModel:    "gpt-4o-wide-peer",
+		Protocol:          ProtocolOpenAIChat,
+		SuiteID:           suite.ID,
+		DetectorKind:      DetectorLogprobs,
+		SourceType:        SourceOfficialDirect,
+		SourceLabel:       "wide-peer",
+		SampleCount:       3,
+		SelfDivergenceP95: 0.50,
+		MatchThreshold:    0.08,
+		SuspectThreshold:  0.18,
+		Logprobs: makeLogprobsSignatureFromProbes(
+			[]TokenProb{{Token: " sky", Prob: 0.50}, {Token: " mist", Prob: 0.45}},
+			[]TokenProb{{Token: "ok", Prob: 0.85}},
+		),
+	})
+	require.NoError(t, err)
+
+	job, err := svc.StartCaptureJob(ctx, CaptureRequest{
+		TargetSource: TargetSourceAdHoc,
+		Protocol:     ProtocolOpenAIChat,
+		BaseURL:      "https://api.example.com/v1",
+		APIKey:       "sk-overlap-neg-12345",
+		SuiteID:      suite.ID,
+		Models:       []string{"gpt-4o"},
+	}, 1)
+	require.NoError(t, err)
+
+	done := waitForCaptureJobTerminal(t, svc, job.ID)
+	require.Equal(t, RunStatusCompleted, done.Status)
+	require.Len(t, done.Results, 1)
+	require.NotNil(t, done.Results[0].LogprobsSelfDivP95)
+	require.Equal(t, 0.0, *done.Results[0].LogprobsSelfDivP95)
+	require.NotNil(t, done.Results[0].LogprobsNearestDist)
+	require.Greater(t, *done.Results[0].LogprobsNearestDist, 0.0)
+	require.False(t, done.Results[0].OverlapWarning)
+	require.Empty(t, done.Results[0].OverlapDetails)
+}
+
+func TestStopWaitsForInflightCreateCaptureJob(t *testing.T) {
+	ctx := context.Background()
+	baseStore := NewMemoryStore()
+	suite := seedMinimalSuite(t, baseStore)
+
+	inCreate := make(chan struct{})
+	releaseCreate := make(chan struct{})
+	store := &blockingCreateCaptureStore{
+		MemoryStore:   baseStore,
+		inCreate:      inCreate,
+		releaseCreate: releaseCreate,
+	}
+
+	resolver := NewTargetResolverWithOptions(
+		&stubAccountLookup{},
+		&stubProxyLookup{},
+		withResolverLookupNetIPForTest(func(_ context.Context, _, _ string) ([]netip.Addr, error) {
+			return []netip.Addr{netip.MustParseAddr("93.184.216.34")}, nil
+		}),
+	)
+	svc := NewBaselineService(store, resolver, NewOrchestrator(&mockProbeClient{}))
+
+	var startErr error
+	startDone := make(chan struct{})
+	go func() {
+		defer close(startDone)
+		reqCtx, reqCancel := context.WithCancel(ctx)
+		defer reqCancel()
+		_, startErr = svc.StartCaptureJob(reqCtx, CaptureRequest{
+			TargetSource: TargetSourceAdHoc,
+			Protocol:     ProtocolAnthropic,
+			BaseURL:      "https://api.example.com",
+			APIKey:       "sk-stop-race-12345",
+			SuiteID:      suite.ID,
+			Models:       []string{"claude-sonnet-4-6"},
+		}, 1)
+	}()
+
+	<-inCreate
+	stopDone := make(chan struct{})
+	go func() {
+		defer close(stopDone)
+		svc.Stop()
+	}()
+
+	// Stop must block until CreateCaptureJob finishes and cancels the queued job.
+	select {
+	case <-stopDone:
+		t.Fatalf("Stop returned while CreateCaptureJob was still in flight")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	close(releaseCreate)
+	<-startDone
+	<-stopDone
+
+	require.Error(t, startErr)
+	require.NotZero(t, store.lastCreatedID)
+	persisted, err := baseStore.GetCaptureJob(ctx, store.lastCreatedID)
+	require.NoError(t, err)
+	require.Equal(t, RunStatusCancelled, persisted.Status)
+}
+
+func TestImportBundlePrevalidatesSuiteHashAndStrictSuiteResolution(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("rejects_suite_content_hash_conflict_before_any_writes", func(t *testing.T) {
+		destSvc, destStore := newTestBaselineServiceEnv(t, nil, nil, nil, nil)
+		require.NoError(t, destSvc.EnsureSeeds(ctx))
+
+		srcSvc, srcStore := newTestBaselineServiceEnv(t, nil, nil, nil, nil)
+		conflictingSuite, err := srcStore.CreateSuite(ctx, ProbeSuite{
+			SuiteKey:   "builtin-public",
+			Version:    "v1",
+			Name:       "Modified Builtin",
+			Visibility: VisibilityPublic,
+			Status:     StatusActive,
+			Probes: []ProbeDefinition{
+				{ID: "different-probe", Kind: DetectorBehavior, Prompt: "Different prompt", MaxTokens: 32, Weight: 1.0},
+			},
+		})
+		require.NoError(t, err)
+		_, err = srcStore.UpsertFamilyMap(ctx, FamilyMap{
+			CanonicalModel: "should-not-be-imported",
+			Family:         "test",
+		})
+		require.NoError(t, err)
+		_, err = srcStore.UpsertActiveBaseline(ctx, Baseline{
+			CanonicalModel: "gpt-4o",
+			Protocol:       ProtocolOpenAIChat,
+			SuiteID:        conflictingSuite.ID,
+			DetectorKind:   DetectorBehavior,
+			Behavior: &BehaviorSignature{
+				Probes: map[string]BehaviorProbeSignature{
+					"different-probe": {ProbeID: "different-probe", Samples: []string{"ok"}},
+				},
+			},
+		})
+		require.NoError(t, err)
+
+		bundle, err := srcSvc.ExportBundle(ctx, true)
+		require.NoError(t, err)
+
+		_, err = destSvc.ImportBundle(ctx, ImportBundleRequest{
+			Bundle:       *bundle,
+			ConflictMode: ImportConflictOverwrite,
+		})
+		require.Error(t, err)
+		require.ErrorIs(t, err, ErrSuiteImmutable)
+
+		// Zero writes occurred: family map and baseline were not persisted.
+		fms, err := destStore.ListFamilyMaps(ctx)
+		require.NoError(t, err)
+		for _, fm := range fms {
+			require.NotEqual(t, "should-not-be-imported", fm.CanonicalModel)
+		}
+		bls, err := destStore.ListBaselines(ctx, BaselineFilter{})
+		require.NoError(t, err)
+		require.Empty(t, bls)
+	})
+
+	t.Run("rejects_baseline_referencing_destination_suite_id_not_in_bundle", func(t *testing.T) {
+		destSvc, destStore := newTestBaselineServiceEnv(t, nil, nil, nil, nil)
+		destSuite := seedMinimalSuite(t, destStore)
+
+		bundle := Bundle{
+			SchemaVersion:  DefaultBundleSchemaVersion,
+			ExportedAt:     time.Now().UTC(),
+			IncludePrivate: false,
+			Suites:         []ProbeSuite{},
+			FamilyMaps: []FamilyMap{
+				{CanonicalModel: "should-not-write-family", Family: "test"},
+			},
+			Baselines: []Baseline{
+				{
+					CanonicalModel: "gpt-4o",
+					Protocol:       ProtocolOpenAIChat,
+					SuiteID:        destSuite.ID, // raw destination-local ID only, suite missing from Bundle.Suites
+					DetectorKind:   DetectorBehavior,
+					Behavior: &BehaviorSignature{
+						Probes: map[string]BehaviorProbeSignature{
+							"bh-1": {ProbeID: "bh-1", Samples: []string{"ok"}},
+						},
+					},
+				},
+			},
+		}
+		sha, err := computeBundleSHA256(bundle)
+		require.NoError(t, err)
+		bundle.SHA256 = sha
+
+		_, err = destSvc.ImportBundle(ctx, ImportBundleRequest{Bundle: bundle})
+		require.Error(t, err)
+		require.Equal(t, "MODELFP_INVALID_BUNDLE_SUITE", infraerrors.Reason(err))
+
+		fms, err := destStore.ListFamilyMaps(ctx)
+		require.NoError(t, err)
+		require.Empty(t, fms)
+	})
+}
+
+type failOnBaselineWriteStore struct {
+	*MemoryStore
+	failKind DetectorKind
+	failErr  error
+}
+
+func (f *failOnBaselineWriteStore) UpsertActiveBaseline(ctx context.Context, baseline Baseline) (*Baseline, error) {
+	if baseline.DetectorKind == f.failKind {
+		return nil, f.failErr
+	}
+	return f.MemoryStore.UpsertActiveBaseline(ctx, baseline)
+}
+
+type blockingCreateCaptureStore struct {
+	*MemoryStore
+	inCreate      chan struct{}
+	releaseCreate chan struct{}
+	mu            sync.Mutex
+	lastCreatedID int64
+}
+
+func (b *blockingCreateCaptureStore) CreateCaptureJob(ctx context.Context, job CaptureJob) (*CaptureJob, error) {
+	created, err := b.MemoryStore.CreateCaptureJob(ctx, job)
+	if err == nil && created != nil {
+		b.mu.Lock()
+		b.lastCreatedID = created.ID
+		b.mu.Unlock()
+	}
+	close(b.inCreate)
+	<-b.releaseCreate
+	return created, err
+}

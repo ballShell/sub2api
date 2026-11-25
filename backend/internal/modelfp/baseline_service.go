@@ -320,7 +320,22 @@ func (s *BaselineService) StartCaptureJob(ctx context.Context, req CaptureReques
 	}
 	sourceLabel = truncateRunes(redactSecrets(sourceLabel, resolved.Target), maxBaselineLabelChars)
 	snapshotOverride := truncateRunes(redactSecrets(strings.TrimSpace(req.UpstreamSnapshot), resolved.Target), maxBaselineLabelChars)
-	notes := redactSecrets(strings.TrimSpace(req.Notes), resolved.Target)
+	notes := redactExactSecrets(strings.TrimSpace(req.Notes), resolved.Target)
+
+	for _, m := range models {
+		if modelContainsCredentials(m, resolved.Target) {
+			return nil, infraerrors.BadRequest("MODELFP_INVALID_MODELS", "model name must not contain target credentials")
+		}
+	}
+
+	s.mu.Lock()
+	if s.stopped {
+		s.mu.Unlock()
+		return nil, infraerrors.ServiceUnavailable("MODELFP_SERVICE_STOPPED", "baseline service is shutting down")
+	}
+	jobCtx, jobCancel := context.WithCancel(s.baseCtx)
+	s.wg.Add(1)
+	s.mu.Unlock()
 
 	created, err := s.store.CreateCaptureJob(ctx, CaptureJob{
 		Status:          RunStatusQueued,
@@ -334,22 +349,26 @@ func (s *BaselineService) StartCaptureJob(ctx context.Context, req CaptureReques
 		CreatedBy:       adminID,
 	})
 	if err != nil {
+		jobCancel()
+		s.wg.Done()
 		return nil, err
 	}
 
 	s.mu.Lock()
-	if s.stopped {
-		s.mu.Unlock()
+	stoppedNow := s.stopped
+	s.mu.Unlock()
+	if stoppedNow {
 		now := s.currentTime()
 		created.Status = RunStatusCancelled
 		created.ErrorMessage = "service stopped before capture started"
 		created.FinishedAt = &now
-		_ = s.store.UpdateCaptureJob(ctx, *created)
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), captureCleanupTimeout)
+		_ = s.store.UpdateCaptureJob(cleanupCtx, *created)
+		cleanupCancel()
+		jobCancel()
+		s.wg.Done()
 		return nil, infraerrors.ServiceUnavailable("MODELFP_SERVICE_STOPPED", "baseline service is shutting down")
 	}
-	jobCtx, jobCancel := context.WithCancel(s.baseCtx)
-	s.wg.Add(1)
-	s.mu.Unlock()
 
 	go s.runCaptureJob(
 		jobCtx,
@@ -440,8 +459,27 @@ func (s *BaselineService) runCaptureJob(
 		}
 
 		res := CaptureModelResult{
-			Model:          claimedModel,
-			CanonicalModel: canonicalModel,
+			Model:          redactSecrets(claimedModel, resolved.Target),
+			CanonicalModel: redactSecrets(canonicalModel, resolved.Target),
+		}
+
+		if modelContainsCredentials(upstreamModel, resolved.Target) {
+			safeErr := "upstream model mapping contains credentials and was rejected"
+			res.Error = safeErr
+			if firstErrMsg == "" {
+				firstErrMsg = safeErr
+			}
+			job.Results = append(job.Results, res)
+			job.CompletedModels++
+			if err := s.store.UpdateCaptureJob(ctx, job); err != nil {
+				if ctx.Err() != nil {
+					persistFinal(RunStatusCancelled, "capture cancelled")
+					return
+				}
+				persistFinal(RunStatusFailed, err.Error())
+				return
+			}
+			continue
 		}
 
 		samples, capErr := s.orchestrator.CaptureModelSignatures(ctx, resolved.Target, upstreamModel, suite, job.SampleRounds)
@@ -456,84 +494,92 @@ func (s *BaselineService) runCaptureJob(
 				firstErrMsg = safeErr
 			}
 		} else {
+			cleanBehavior := sanitizeCapturedBehaviorSignature(samples.AggregatedBehavior, resolved.Target)
+			cleanLogprobs := sanitizeCapturedLogprobsSignature(samples.AggregatedLogprobs, resolved.Target)
+
 			snapshot := snapshotOverride
-			if snapshot == "" && samples.AggregatedBehavior != nil && len(samples.AggregatedBehavior.ResponseModels) > 0 {
-				snapshot = truncateRunes(redactSecrets(samples.AggregatedBehavior.ResponseModels[0], resolved.Target), maxBaselineLabelChars)
+			if snapshot == "" && cleanBehavior != nil && len(cleanBehavior.ResponseModels) > 0 {
+				snapshot = truncateRunes(redactSecrets(cleanBehavior.ResponseModels[0], resolved.Target), maxBaselineLabelChars)
 			}
+			snapshot = truncateRunes(redactSecrets(snapshot, resolved.Target), maxBaselineLabelChars)
 
-			modelSaved := false
-			if samples.LogprobsSupported && samples.AggregatedLogprobs != nil {
-				lpID, selfDiv, nearDist, overlap, detail, saveErr := s.persistCapturedBaseline(
-					ctx,
-					canonicalModel,
-					resolved.Target.Protocol,
-					suite,
-					DetectorLogprobs,
-					job.SourceType,
-					sourceLabel,
-					snapshot,
-					job.SampleRounds,
-					samples.LogprobsSelfDivergenceP95,
-					samples.AggregatedLogprobs,
-					nil,
-					ttlDays,
-					notes,
-				)
-				if saveErr != nil {
-					safeErr := redactSecrets(saveErr.Error(), resolved.Target)
-					res.Error = safeErr
-					if firstErrMsg == "" {
-						firstErrMsg = safeErr
-					}
-				} else {
-					res.LogprobsBaselineID = &lpID
-					res.LogprobsSelfDivP95 = &selfDiv
-					res.LogprobsNearestDist = nearDist
-					if overlap {
-						res.OverlapWarning = true
-						res.OverlapDetails = append(res.OverlapDetails, detail)
-					}
-					modelSaved = true
+			if cleanBehavior == nil {
+				safeErr := "missing behavior signature for baseline capture"
+				res.Error = safeErr
+				if firstErrMsg == "" {
+					firstErrMsg = safeErr
 				}
-			}
-
-			if res.Error == "" && samples.AggregatedBehavior != nil {
-				bhID, selfDiv, nearDist, overlap, detail, saveErr := s.persistCapturedBaseline(
-					ctx,
-					canonicalModel,
-					resolved.Target.Protocol,
-					suite,
-					DetectorBehavior,
-					job.SourceType,
-					sourceLabel,
-					snapshot,
-					job.SampleRounds,
-					samples.BehaviorSelfDivergenceP95,
-					nil,
-					samples.AggregatedBehavior,
-					ttlDays,
-					notes,
-				)
-				if saveErr != nil {
-					safeErr := redactSecrets(saveErr.Error(), resolved.Target)
-					res.Error = safeErr
-					if firstErrMsg == "" {
-						firstErrMsg = safeErr
+			} else {
+				logprobsOK := true
+				if samples.LogprobsSupported && cleanLogprobs != nil {
+					lpID, selfDiv, nearDist, overlap, detail, saveErr := s.persistCapturedBaseline(
+						ctx,
+						canonicalModel,
+						resolved.Target.Protocol,
+						suite,
+						DetectorLogprobs,
+						job.SourceType,
+						sourceLabel,
+						snapshot,
+						job.SampleRounds,
+						samples.LogprobsSelfDivergenceP95,
+						cleanLogprobs,
+						nil,
+						ttlDays,
+						notes,
+					)
+					if saveErr != nil {
+						logprobsOK = false
+						safeErr := redactSecrets(saveErr.Error(), resolved.Target)
+						res.Error = safeErr
+						if firstErrMsg == "" {
+							firstErrMsg = safeErr
+						}
+					} else {
+						res.LogprobsBaselineID = &lpID
+						res.LogprobsSelfDivP95 = &selfDiv
+						res.LogprobsNearestDist = nearDist
+						if overlap {
+							res.OverlapWarning = true
+							res.OverlapDetails = append(res.OverlapDetails, redactSecrets(detail, resolved.Target))
+						}
 					}
-				} else {
-					res.BehaviorBaselineID = &bhID
-					res.BehaviorSelfDivP95 = &selfDiv
-					res.BehaviorNearestDist = nearDist
-					if overlap {
-						res.OverlapWarning = true
-						res.OverlapDetails = append(res.OverlapDetails, detail)
-					}
-					modelSaved = true
 				}
-			}
 
-			if modelSaved {
-				succeededCount++
+				if logprobsOK {
+					bhID, selfDiv, nearDist, overlap, detail, saveErr := s.persistCapturedBaseline(
+						ctx,
+						canonicalModel,
+						resolved.Target.Protocol,
+						suite,
+						DetectorBehavior,
+						job.SourceType,
+						sourceLabel,
+						snapshot,
+						job.SampleRounds,
+						samples.BehaviorSelfDivergenceP95,
+						nil,
+						cleanBehavior,
+						ttlDays,
+						notes,
+					)
+					if saveErr != nil {
+						safeErr := redactSecrets(saveErr.Error(), resolved.Target)
+						res.Error = safeErr
+						if firstErrMsg == "" {
+							firstErrMsg = safeErr
+						}
+					} else {
+						res.BehaviorBaselineID = &bhID
+						res.BehaviorSelfDivP95 = &selfDiv
+						res.BehaviorNearestDist = nearDist
+						if overlap {
+							res.OverlapWarning = true
+							res.OverlapDetails = append(res.OverlapDetails, redactSecrets(detail, resolved.Target))
+						}
+						succeededCount++
+					}
+				}
 			}
 		}
 
@@ -600,18 +646,15 @@ func (s *BaselineService) persistCapturedBaseline(
 
 	overlap := false
 	var overlapDetail string
-	if nearDist != nil && nearestPeer != nil {
-		maxSelf := math.Max(selfDivP95, nearestPeer.SelfDivergenceP95)
-		if (maxSelf > 0 && *nearDist < 1.5*maxSelf) || *nearDist == 0 {
-			overlap = true
-			overlapDetail = fmt.Sprintf(
-				"%s: nearest peer %s distance=%.4f (1.5*D_self=%.4f)",
-				kind,
-				nearestPeer.CanonicalModel,
-				*nearDist,
-				1.5*maxSelf,
-			)
-		}
+	if nearDist != nil && nearestPeer != nil && selfDivP95 > 0 && *nearDist < 1.5*selfDivP95 {
+		overlap = true
+		overlapDetail = fmt.Sprintf(
+			"%s: nearest peer %s distance=%.4f (1.5*D_self=%.4f)",
+			kind,
+			nearestPeer.CanonicalModel,
+			*nearDist,
+			1.5*selfDivP95,
+		)
 	}
 
 	saved, err := s.store.UpsertActiveBaseline(ctx, Baseline{
@@ -848,16 +891,16 @@ func (s *BaselineService) ImportBundle(ctx context.Context, req ImportBundleRequ
 		}
 	}
 
+	if err := prevalidateBundleReferences(req.Bundle, suiteByKeyVer); err != nil {
+		return nil, err
+	}
+
 	result := &ImportBundleResult{}
-	bundleSuiteIDMap := make(map[int64]int64, len(req.Bundle.Suites))
 
 	for _, suite := range req.Bundle.Suites {
 		key := suiteKeyVersion(suite.SuiteKey, suite.Version)
-		if existing, exists := suiteByKeyVer[key]; exists {
+		if _, exists := suiteByKeyVer[key]; exists {
 			result.SuitesSkipped++
-			if suite.ID > 0 {
-				bundleSuiteIDMap[suite.ID] = existing.ID
-			}
 			continue
 		}
 
@@ -875,6 +918,13 @@ func (s *BaselineService) ImportBundle(ctx context.Context, req ImportBundleRequ
 		if toCreate.Probes == nil {
 			toCreate.Probes = []ProbeDefinition{}
 		}
+		if strings.TrimSpace(toCreate.ContentHash) == "" {
+			hash, hashErr := ComputeContentHash(toCreate.Probes)
+			if hashErr != nil {
+				return nil, hashErr
+			}
+			toCreate.ContentHash = hash
+		}
 		created, err := s.store.CreateSuite(ctx, toCreate)
 		if err != nil {
 			if errors.Is(err, ErrSuiteImmutable) {
@@ -887,9 +937,6 @@ func (s *BaselineService) ImportBundle(ctx context.Context, req ImportBundleRequ
 		suiteByKeyVer[key] = *created
 		if created.IsDefault && created.Status == StatusActive {
 			hasActiveDefault = true
-		}
-		if suite.ID > 0 {
-			bundleSuiteIDMap[suite.ID] = created.ID
 		}
 	}
 
@@ -936,11 +983,20 @@ func (s *BaselineService) ImportBundle(ctx context.Context, req ImportBundleRequ
 		}] = struct{}{}
 	}
 
+	bundleSuiteByKeyVer, bundleSuiteByID := indexBundleSuites(req.Bundle.Suites)
 	for _, b := range req.Bundle.Baselines {
-		targetSuiteID, err := s.resolveImportedBaselineSuiteID(ctx, b, suiteByKeyVer, bundleSuiteIDMap)
+		suiteRef, err := resolveBundleSuiteForBaseline(b, bundleSuiteByKeyVer, bundleSuiteByID)
 		if err != nil {
 			return nil, err
 		}
+		targetSuite, ok := suiteByKeyVer[suiteKeyVersion(suiteRef.SuiteKey, suiteRef.Version)]
+		if !ok {
+			return nil, infraerrors.BadRequest(
+				"MODELFP_INVALID_BUNDLE_SUITE",
+				fmt.Sprintf("baseline %q references suite (%s/%s) that failed resolution", b.CanonicalModel, suiteRef.SuiteKey, suiteRef.Version),
+			)
+		}
+		targetSuiteID := targetSuite.ID
 		key := baselineActiveKey{
 			canonicalModel: strings.TrimSpace(b.CanonicalModel),
 			protocol:       b.Protocol,
@@ -955,6 +1011,8 @@ func (s *BaselineService) ImportBundle(ctx context.Context, req ImportBundleRequ
 		toSave := b
 		toSave.ID = 0
 		toSave.SuiteID = targetSuiteID
+		toSave.SuiteKey = targetSuite.SuiteKey
+		toSave.SuiteVersion = targetSuite.Version
 		toSave.Status = StatusActive
 		if _, err := s.store.UpsertActiveBaseline(ctx, toSave); err != nil {
 			return nil, err
@@ -1135,7 +1193,7 @@ func (s *BaselineService) resolveCaptureTarget(ctx context.Context, req CaptureR
 	}
 }
 
-func (s *BaselineService) resolveCaptureSuite(ctx context.Context, suiteID int64, proto Protocol) (*ProbeSuite, error) {
+func (s *BaselineService) resolveCaptureSuite(ctx context.Context, suiteID int64, _ Protocol) (*ProbeSuite, error) {
 	var (
 		suite *ProbeSuite
 		err   error
@@ -1152,41 +1210,13 @@ func (s *BaselineService) resolveCaptureSuite(ctx context.Context, suiteID int64
 		return nil, infraerrors.BadRequest("MODELFP_SUITE_ARCHIVED", "cannot capture baselines using an archived probe suite")
 	}
 
-	runLogprobs := protocolSupportsLogprobs(proto) && hasProbesOfKind(*suite, DetectorLogprobs)
-	runBehavior := hasProbesOfKind(*suite, DetectorBehavior)
-	if !runLogprobs && !runBehavior {
+	if !hasProbesOfKind(*suite, DetectorBehavior) {
 		return nil, infraerrors.BadRequest(
 			"MODELFP_NO_APPLICABLE_PROBES",
-			fmt.Sprintf("suite %s/%s contains no applicable probes for protocol %s", suite.SuiteKey, suite.Version, proto),
+			fmt.Sprintf("suite %s/%s must contain at least one behavior probe for baseline capture", suite.SuiteKey, suite.Version),
 		)
 	}
 	return suite, nil
-}
-
-func (s *BaselineService) resolveImportedBaselineSuiteID(
-	ctx context.Context,
-	b Baseline,
-	suiteByKeyVer map[string]ProbeSuite,
-	bundleSuiteIDMap map[int64]int64,
-) (int64, error) {
-	if b.SuiteKey != "" && b.SuiteVersion != "" {
-		if suite, ok := suiteByKeyVer[suiteKeyVersion(b.SuiteKey, b.SuiteVersion)]; ok {
-			return suite.ID, nil
-		}
-	}
-	if b.SuiteID > 0 {
-		if mappedID, ok := bundleSuiteIDMap[b.SuiteID]; ok {
-			return mappedID, nil
-		}
-		existing, err := s.store.GetSuite(ctx, b.SuiteID)
-		if err == nil && existing != nil {
-			return existing.ID, nil
-		}
-	}
-	return 0, infraerrors.BadRequest(
-		"MODELFP_INVALID_BUNDLE_SUITE",
-		fmt.Sprintf("baseline %q references unknown suite (%s/%s id=%d)", b.CanonicalModel, b.SuiteKey, b.SuiteVersion, b.SuiteID),
-	)
 }
 
 func toBaselineView(b Baseline, now time.Time) BaselineView {
@@ -1523,15 +1553,42 @@ func computeBundleSHA256(bundle Bundle) (string, error) {
 }
 
 func validateBundleEntities(bundle Bundle) error {
+	seenSuiteKeyVer := make(map[string]struct{}, len(bundle.Suites))
+	seenSuiteIDs := make(map[int64]struct{}, len(bundle.Suites))
 	for i, s := range bundle.Suites {
 		if strings.TrimSpace(s.SuiteKey) == "" || strings.TrimSpace(s.Version) == "" {
 			return infraerrors.BadRequest("MODELFP_INVALID_BUNDLE", fmt.Sprintf("suites[%d] requires suite_key and version", i))
+		}
+		kv := suiteKeyVersion(s.SuiteKey, s.Version)
+		if _, dup := seenSuiteKeyVer[kv]; dup {
+			return infraerrors.BadRequest("MODELFP_INVALID_BUNDLE", fmt.Sprintf("duplicate suite %s/%s in bundle", s.SuiteKey, s.Version))
+		}
+		seenSuiteKeyVer[kv] = struct{}{}
+		if s.ID > 0 {
+			if _, dup := seenSuiteIDs[s.ID]; dup {
+				return infraerrors.BadRequest("MODELFP_INVALID_BUNDLE", fmt.Sprintf("duplicate suite id %d in bundle", s.ID))
+			}
+			seenSuiteIDs[s.ID] = struct{}{}
 		}
 		if s.Visibility != "" && s.Visibility != VisibilityPublic && s.Visibility != VisibilityPrivate {
 			return infraerrors.BadRequest("MODELFP_INVALID_BUNDLE", fmt.Sprintf("suites[%d] has invalid visibility %q", i, s.Visibility))
 		}
 		if s.Status != "" && s.Status != StatusActive && s.Status != StatusArchived {
 			return infraerrors.BadRequest("MODELFP_INVALID_BUNDLE", fmt.Sprintf("suites[%d] has invalid status %q", i, s.Status))
+		}
+		probes := s.Probes
+		if probes == nil {
+			probes = []ProbeDefinition{}
+		}
+		computedHash, err := ComputeContentHash(probes)
+		if err != nil {
+			return fmt.Errorf("compute content hash for bundle suite %s/%s: %w", s.SuiteKey, s.Version, err)
+		}
+		if trimmedHash := strings.TrimSpace(s.ContentHash); trimmedHash != "" && !strings.EqualFold(trimmedHash, computedHash) {
+			return infraerrors.BadRequest(
+				"MODELFP_INVALID_BUNDLE",
+				fmt.Sprintf("suites[%d] (%s/%s) content_hash mismatch", i, s.SuiteKey, s.Version),
+			)
 		}
 	}
 	for i, fm := range bundle.FamilyMaps {
@@ -1557,6 +1614,221 @@ func validateBundleEntities(bundle Bundle) error {
 		}
 	}
 	return nil
+}
+
+func prevalidateBundleReferences(bundle Bundle, existingSuitesByKeyVer map[string]ProbeSuite) error {
+	for _, s := range bundle.Suites {
+		probes := s.Probes
+		if probes == nil {
+			probes = []ProbeDefinition{}
+		}
+		bundleHash := strings.TrimSpace(s.ContentHash)
+		if bundleHash == "" {
+			computed, err := ComputeContentHash(probes)
+			if err != nil {
+				return err
+			}
+			bundleHash = computed
+		}
+		if existing, exists := existingSuitesByKeyVer[suiteKeyVersion(s.SuiteKey, s.Version)]; exists {
+			existingHash := strings.TrimSpace(existing.ContentHash)
+			if existingHash == "" {
+				existingProbes := existing.Probes
+				if existingProbes == nil {
+					existingProbes = []ProbeDefinition{}
+				}
+				computed, err := ComputeContentHash(existingProbes)
+				if err != nil {
+					return err
+				}
+				existingHash = computed
+			}
+			if !strings.EqualFold(existingHash, bundleHash) {
+				return infraerrors.Conflict(
+					ErrSuiteImmutable.Reason,
+					fmt.Sprintf("suite %s/%s already exists with a different content_hash", s.SuiteKey, s.Version),
+				)
+			}
+		}
+	}
+
+	bundleSuiteByKeyVer, bundleSuiteByID := indexBundleSuites(bundle.Suites)
+	for _, b := range bundle.Baselines {
+		if _, err := resolveBundleSuiteForBaseline(b, bundleSuiteByKeyVer, bundleSuiteByID); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func indexBundleSuites(suites []ProbeSuite) (map[string]ProbeSuite, map[int64]ProbeSuite) {
+	byKeyVer := make(map[string]ProbeSuite, len(suites))
+	byID := make(map[int64]ProbeSuite, len(suites))
+	for _, s := range suites {
+		byKeyVer[suiteKeyVersion(s.SuiteKey, s.Version)] = s
+		if s.ID > 0 {
+			byID[s.ID] = s
+		}
+	}
+	return byKeyVer, byID
+}
+
+func resolveBundleSuiteForBaseline(
+	b Baseline,
+	bundleSuiteByKeyVer map[string]ProbeSuite,
+	bundleSuiteByID map[int64]ProbeSuite,
+) (ProbeSuite, error) {
+	hasKeyVer := strings.TrimSpace(b.SuiteKey) != "" && strings.TrimSpace(b.SuiteVersion) != ""
+	var byID ProbeSuite
+	var hasByID bool
+	if b.SuiteID > 0 {
+		byID, hasByID = bundleSuiteByID[b.SuiteID]
+	}
+
+	if hasKeyVer {
+		targetKV := suiteKeyVersion(b.SuiteKey, b.SuiteVersion)
+		if s, ok := bundleSuiteByKeyVer[targetKV]; ok {
+			if hasByID && suiteKeyVersion(byID.SuiteKey, byID.Version) != targetKV {
+				return ProbeSuite{}, infraerrors.BadRequest(
+					"MODELFP_INVALID_BUNDLE_SUITE",
+					fmt.Sprintf("baseline %q has conflicting suite_id=%d and suite (%s/%s)", b.CanonicalModel, b.SuiteID, b.SuiteKey, b.SuiteVersion),
+				)
+			}
+			return s, nil
+		}
+	} else if hasByID {
+		return byID, nil
+	}
+
+	return ProbeSuite{}, infraerrors.BadRequest(
+		"MODELFP_INVALID_BUNDLE_SUITE",
+		fmt.Sprintf("baseline %q references suite (%s/%s id=%d) not included in bundle", b.CanonicalModel, b.SuiteKey, b.SuiteVersion, b.SuiteID),
+	)
+}
+
+func modelContainsCredentials(model string, target ProbeTarget) bool {
+	if model == "" {
+		return false
+	}
+	if containsAnySecretOrToken(model, collectSecrets(target)) {
+		return true
+	}
+	if key := strings.TrimSpace(target.APIKey); key != "" && strings.Contains(model, key) {
+		return true
+	}
+	return false
+}
+
+func sanitizeCapturedLogprobsSignature(sig *LogprobsSignature, target ProbeTarget) *LogprobsSignature {
+	if sig == nil {
+		return nil
+	}
+	out := &LogprobsSignature{
+		Probes: make(map[string]LogprobsProbeSignature, len(sig.Probes)),
+	}
+	for pid, p := range sig.Probes {
+		cleanPID := redactExactSecrets(pid, target)
+		cleanDist := make(map[string]float64, len(p.Distribution))
+		keys := make([]string, 0, len(p.Distribution))
+		for tok := range p.Distribution {
+			keys = append(keys, tok)
+		}
+		sort.Strings(keys)
+		for _, tok := range keys {
+			prob := p.Distribution[tok]
+			cleanTok := redactExactSecrets(tok, target)
+			if cleanTok == "" && tok != "" {
+				cleanTok = redactedSecretPlaceholder
+			}
+			cleanDist[cleanTok] += prob
+		}
+
+		var cleanTop []TokenProb
+		if len(p.TopTokens) > 0 {
+			merged := make(map[string]TokenProb, len(p.TopTokens))
+			order := make([]string, 0, len(p.TopTokens))
+			for _, tp := range p.TopTokens {
+				cleanTok := redactExactSecrets(tp.Token, target)
+				if prev, ok := merged[cleanTok]; ok {
+					prev.Prob += tp.Prob
+					prev.Logprob = 0
+					merged[cleanTok] = prev
+				} else {
+					order = append(order, cleanTok)
+					cp := tp
+					cp.Token = cleanTok
+					if cleanTok != tp.Token {
+						cp.Logprob = 0
+					}
+					merged[cleanTok] = cp
+				}
+			}
+			cleanTop = make([]TokenProb, 0, len(order))
+			for _, tok := range order {
+				cleanTop = append(cleanTop, merged[tok])
+			}
+			sort.SliceStable(cleanTop, func(i, j int) bool {
+				return cleanTop[i].Prob > cleanTop[j].Prob
+			})
+		}
+
+		out.Probes[cleanPID] = LogprobsProbeSignature{
+			ProbeID:      redactExactSecrets(p.ProbeID, target),
+			Distribution: cleanDist,
+			TopTokens:    cleanTop,
+			SampleCount:  p.SampleCount,
+		}
+	}
+	return out
+}
+
+func sanitizeCapturedBehaviorSignature(sig *BehaviorSignature, target ProbeTarget) *BehaviorSignature {
+	if sig == nil {
+		return nil
+	}
+	out := &BehaviorSignature{
+		Probes:             make(map[string]BehaviorProbeSignature, len(sig.Probes)),
+		ResponseModels:     redactDistinctSlice(sig.ResponseModels, target),
+		SystemFingerprints: redactDistinctSlice(sig.SystemFingerprints, target),
+	}
+	if sig.HasReasoningField != nil {
+		flag := *sig.HasReasoningField
+		out.HasReasoningField = &flag
+	}
+	for pid, p := range sig.Probes {
+		cleanPID := redactExactSecrets(pid, target)
+		cleanSamples := make([]string, len(p.Samples))
+		for i, sample := range p.Samples {
+			cleanSamples[i] = redactExactSecrets(sample, target)
+		}
+		out.Probes[cleanPID] = BehaviorProbeSignature{
+			ProbeID:         redactExactSecrets(p.ProbeID, target),
+			Samples:         cleanSamples,
+			ExpectedFormat:  p.ExpectedFormat,
+			FormatMatchRate: p.FormatMatchRate,
+		}
+	}
+	return out
+}
+
+func redactDistinctSlice(items []string, target ProbeTarget) []string {
+	if items == nil {
+		return nil
+	}
+	out := make([]string, 0, len(items))
+	seen := make(map[string]struct{}, len(items))
+	for _, item := range items {
+		clean := redactExactSecrets(item, target)
+		if clean == "" {
+			continue
+		}
+		if _, ok := seen[clean]; ok {
+			continue
+		}
+		seen[clean] = struct{}{}
+		out = append(out, clean)
+	}
+	return out
 }
 
 func suiteKeyVersion(suiteKey, version string) string {
