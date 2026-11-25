@@ -17,6 +17,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 	"unicode/utf16"
 )
 
@@ -1245,6 +1246,13 @@ func redactSecretsWithStatus(msg string, status int, target ProbeTarget) string 
 	}
 
 	secrets := collectSecrets(target)
+	if strings.ContainsRune(msg, '\\') {
+		unescaped := unescapeJSONSequences(msg)
+		if containsAnySecretOrToken(unescaped, secrets) {
+			return genericHTTPFallback(status)
+		}
+	}
+
 	out := msg
 	for _, secret := range secrets {
 		out = strings.ReplaceAll(out, secret, redactedSecretPlaceholder)
@@ -1256,13 +1264,6 @@ func redactSecretsWithStatus(msg string, status int, target ProbeTarget) string 
 		return "Bearer " + redactedSecretPlaceholder
 	})
 	out = apiKeyTokenPattern.ReplaceAllString(out, redactedSecretPlaceholder)
-
-	if strings.ContainsRune(out, '\\') {
-		unescaped := unescapeJSONSequences(out)
-		if containsAnySecretOrToken(unescaped, secrets) {
-			return genericHTTPFallback(status)
-		}
-	}
 
 	out = strings.NewReplacer("\r", " ", "\n", " ", "\t", " ").Replace(out)
 	out = strings.TrimSpace(out)
@@ -1326,14 +1327,26 @@ func unescapeJSONSequences(s string) string {
 				if i+6 <= len(s) {
 					if r1, err := strconv.ParseUint(s[i+2:i+6], 16, 32); err == nil {
 						u1 := rune(r1)
-						if utf16.IsSurrogate(u1) && i+12 <= len(s) && s[i+6] == '\\' && s[i+7] == 'u' {
-							if r2, err2 := strconv.ParseUint(s[i+8:i+12], 16, 32); err2 == nil {
-								sb.WriteRune(utf16.DecodeRune(u1, rune(r2)))
-								i += 12
-								continue
+						if 0xD800 <= u1 && u1 <= 0xDBFF {
+							if i+12 <= len(s) && s[i+6] == '\\' && s[i+7] == 'u' {
+								if r2, err2 := strconv.ParseUint(s[i+8:i+12], 16, 32); err2 == nil {
+									u2 := rune(r2)
+									if 0xDC00 <= u2 && u2 <= 0xDFFF {
+										sb.WriteRune(utf16.DecodeRune(u1, u2))
+										i += 12
+										continue
+									}
+								}
 							}
+							sb.WriteRune(unicode.ReplacementChar)
+							i += 6
+							continue
 						}
-						sb.WriteRune(u1)
+						if utf16.IsSurrogate(u1) {
+							sb.WriteRune(unicode.ReplacementChar)
+						} else {
+							sb.WriteRune(u1)
+						}
 						i += 6
 						continue
 					}

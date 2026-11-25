@@ -488,6 +488,74 @@ func TestTransportErrorRedactsAPIKey(t *testing.T) {
 		t.Fatalf("expected multiline mixed-escape secret replaced with generic HTTP 401 fallback, got %q", multiRedacted)
 	}
 
+	// Partially-escaped key whose unescaped prefix matches sk-... regex followed by \uXXXX tail must not leak tail.
+	partialSecret := "sk-prefix1234tail99"
+	partialMsg := `invalid key sk-prefix1234\u0074ail99`
+	partialRedacted := redactSecretsWithStatus(partialMsg, http.StatusUnauthorized, ProbeTarget{APIKey: partialSecret})
+	if partialRedacted != "upstream HTTP 401 Unauthorized" ||
+		strings.Contains(partialRedacted, "tail99") ||
+		strings.Contains(partialRedacted, "prefix1234") ||
+		strings.Contains(partialRedacted, `\u0074`) {
+		t.Fatalf("expected partially-escaped key replaced with generic HTTP 401 fallback without tail leak, got %q", partialRedacted)
+	}
+	if partialDirect := redactSecrets(partialMsg, ProbeTarget{APIKey: partialSecret}); partialDirect != "upstream error (redacted)" {
+		t.Fatalf("expected direct redactSecrets to return redacted fallback for partially-escaped key, got %q", partialDirect)
+	}
+	partialSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = w.Write([]byte(`{"error":{"message":"invalid key sk-prefix1234\\u0074ail99"}}`))
+	}))
+	defer partialSrv.Close()
+	partialHTTPRes := client.ExecuteProbe(context.Background(), ProbeTarget{
+		Protocol: ProtocolOpenAIChat, BaseURL: partialSrv.URL, APIKey: partialSecret,
+	}, "gpt-4o", ProbeDefinition{ID: "p1", Kind: DetectorBehavior, Prompt: "hi", MaxTokens: 16}, false)
+	if partialHTTPRes.ErrorCode != "auth_error" ||
+		partialHTTPRes.ErrorMessage != "upstream HTTP 401 Unauthorized" ||
+		strings.Contains(partialHTTPRes.ErrorMessage, "tail99") {
+		t.Fatalf("expected partially-escaped HTTP error replaced with generic HTTP 401 fallback, got %+v", partialHTTPRes)
+	}
+
+	// Unpaired high surrogate \uD800 immediately followed by \u0073k-... must not swallow \u0073 and must redact key.
+	surrogateSecret := "sk-surrogate-secret-999"
+	surrogateMsg := `bad key \uD800\u0073k-surrogate-secret-999`
+	surrogateRedacted := redactSecretsWithStatus(surrogateMsg, http.StatusUnauthorized, ProbeTarget{APIKey: surrogateSecret})
+	if surrogateRedacted != "upstream HTTP 401 Unauthorized" ||
+		strings.Contains(surrogateRedacted, "surrogate-secret-999") ||
+		strings.Contains(surrogateRedacted, "k-surrogate") ||
+		strings.Contains(surrogateRedacted, `\u0073`) ||
+		strings.Contains(surrogateRedacted, `\uD800`) {
+		t.Fatalf("expected unpaired high surrogate + \\u0073k- secret replaced with generic HTTP 401 fallback, got %q", surrogateRedacted)
+	}
+	if surrogateDirect := redactSecrets(surrogateMsg, ProbeTarget{APIKey: surrogateSecret}); surrogateDirect != "upstream error (redacted)" {
+		t.Fatalf("expected direct redactSecrets to return redacted fallback for unpaired surrogate + secret, got %q", surrogateDirect)
+	}
+	surrogateSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = w.Write([]byte(`{"error":{"message":"bad key \\uD800\\u0073k-surrogate-secret-999"}}`))
+	}))
+	defer surrogateSrv.Close()
+	surrogateHTTPRes := client.ExecuteProbe(context.Background(), ProbeTarget{
+		Protocol: ProtocolOpenAIChat, BaseURL: surrogateSrv.URL, APIKey: surrogateSecret,
+	}, "gpt-4o", ProbeDefinition{ID: "p1", Kind: DetectorBehavior, Prompt: "hi", MaxTokens: 16}, false)
+	if surrogateHTTPRes.ErrorCode != "auth_error" ||
+		surrogateHTTPRes.ErrorMessage != "upstream HTTP 401 Unauthorized" ||
+		strings.Contains(surrogateHTTPRes.ErrorMessage, "surrogate-secret-999") {
+		t.Fatalf("expected unpaired surrogate HTTP error replaced with generic HTTP 401 fallback, got %+v", surrogateHTTPRes)
+	}
+
+	if got := unescapeJSONSequences(`\uD800\u0073k-abc`); got != "\uFFFDsk-abc" {
+		t.Fatalf("expected lone high surrogate to emit replacement char without swallowing \\u0073, got %q", got)
+	}
+	if got := unescapeJSONSequences(`\uD83D\uDE00`); got != "😀" {
+		t.Fatalf("expected valid surrogate pair to decode to emoji, got %q", got)
+	}
+	if got := unescapeJSONSequences(`\uDC00\u0073k-abc`); got != "\uFFFDsk-abc" {
+		t.Fatalf("expected lone low surrogate to emit replacement char without swallowing \\u0073, got %q", got)
+	}
+	if got := unescapeJSONSequences(`\uD800\uD83D\uDE00`); got != "\uFFFD😀" {
+		t.Fatalf("expected lone high surrogate followed by valid surrogate pair to decode cleanly, got %q", got)
+	}
+
 	// Also check DiscoverModels redaction and HTTP error taxonomy
 	statusCases := []struct {
 		status int
